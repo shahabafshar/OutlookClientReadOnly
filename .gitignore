@@ -1,0 +1,49 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache
+.claude
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# pywin32 generated COM type-library cache (in case it lands in-tree)
+gen_py/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local secrets / sandbox
+*.local
+.envrc
+
+# Attachment extraction output (if anyone dumps here during testing)
+attachments_out/
