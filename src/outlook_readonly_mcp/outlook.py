@@ -14,6 +14,10 @@ No code path in this module calls any mutating method on a COM object
 
 from __future__ import annotations
 
+import os
+import shutil
+import sys
+import tempfile
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -29,6 +33,59 @@ except ImportError:  # pragma: no cover - only on non-Windows
 
 
 _THREAD_LOCAL = threading.local()
+
+
+def _looks_like_gen_py_corruption(exc: BaseException) -> bool:
+    """Detect the pywin32 gen_py stale-cache symptom.
+
+    When two processes race on `gencache.EnsureDispatch`, one of them can
+    end up with a half-written typelib stub module that loads but lacks
+    `CLSIDToPackageMap` and other internal tables. The first real method
+    invocation then raises `AttributeError: module 'win32com.gen_py.<guid>'
+    has no attribute 'CLSIDToPackageMap'`. We also catch the late-bound
+    fallback symptom `Outlook.Application.GetNamespace`.
+    """
+    if not isinstance(exc, AttributeError):
+        return False
+    msg = str(exc)
+    return (
+        "CLSIDToPackageMap" in msg
+        or "gen_py" in msg
+        or "GetNamespace" in msg
+    )
+
+
+def _purge_gen_py_cache() -> None:
+    """Nuke every gen_py location pywin32 might be reading from.
+
+    Caches can live in `win32com.__gen_path__`, the per-user temp dir
+    (`%TEMP%\\gen_py`), or the package install location. After deleting
+    on disk we also drop any already-imported stub modules so the next
+    `EnsureDispatch` cannot reuse them.
+    """
+    paths: list[str] = []
+    gen_path = getattr(win32com, "__gen_path__", None)
+    if gen_path:
+        paths.append(gen_path)
+    paths.append(os.path.join(tempfile.gettempdir(), "gen_py"))
+    try:
+        import win32com.gen_py as _gen  # type: ignore[import-not-found]
+
+        pkg_path = os.path.dirname(getattr(_gen, "__file__", "") or "")
+        if pkg_path:
+            paths.append(pkg_path)
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    for p in paths:
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        shutil.rmtree(p, ignore_errors=True)
+
+    for mod_name in [m for m in list(sys.modules) if m.startswith("win32com.gen_py")]:
+        sys.modules.pop(mod_name, None)
 
 
 class OutlookUnavailableError(RuntimeError):
@@ -63,27 +120,46 @@ def com_apartment() -> Iterator[None]:
         pythoncom.CoUninitialize()
 
 
+def _ensure_dispatch_with_probe() -> Any:
+    """`EnsureDispatch` an Outlook.Application and verify it actually works.
+
+    A successful dispatch is not enough — the gen_py typelib stub can be
+    half-written, in which case the first real method call (here a probe
+    to `GetNamespace`) raises `AttributeError: ... CLSIDToPackageMap`.
+    When that happens we purge every gen_py location, drop cached stubs
+    from `sys.modules`, and re-dispatch exactly once.
+    """
+    for attempt in range(2):
+        try:
+            app = win32com.client.gencache.EnsureDispatch("Outlook.Application")
+            # Probe a real method so a corrupt stub fails here, not later
+            # inside an MCP tool call.
+            _ = app.GetNamespace("MAPI")
+            return app
+        except AttributeError as exc:
+            if attempt == 0 and _looks_like_gen_py_corruption(exc):
+                _purge_gen_py_cache()
+                continue
+            raise
+    raise OutlookUnavailableError(
+        "Outlook COM dispatch failed even after clearing the gen_py cache."
+    )
+
+
 def get_application() -> Any:
     """Return a cached Outlook.Application dispatch for the current thread.
 
     pywin32 COM objects are apartment-bound, so we cache per-thread. We use
     `gencache.EnsureDispatch` so that the type library is generated on first
     use — without it, late-bound `Dispatch` can't resolve `GetNamespace` and
-    other early-bound methods reliably.
+    other early-bound methods reliably. The dispatch is probed before being
+    cached so a corrupt typelib stub is detected and self-healed here, not
+    later inside an MCP tool call.
     """
     _require_pywin32()
     app = getattr(_THREAD_LOCAL, "app", None)
     if app is None:
-        try:
-            app = win32com.client.gencache.EnsureDispatch("Outlook.Application")
-        except AttributeError:
-            # Stale generated cache — rebuild and retry once.
-            import shutil
-
-            gen_path = getattr(win32com, "__gen_path__", None)
-            if gen_path:
-                shutil.rmtree(gen_path, ignore_errors=True)
-            app = win32com.client.gencache.EnsureDispatch("Outlook.Application")
+        app = _ensure_dispatch_with_probe()
         _THREAD_LOCAL.app = app
     return app
 
@@ -91,7 +167,17 @@ def get_application() -> Any:
 def get_namespace() -> Any:
     """Return the MAPI namespace for the active Outlook session."""
     app = get_application()
-    return app.GetNamespace("MAPI")
+    try:
+        return app.GetNamespace("MAPI")
+    except AttributeError as exc:
+        # If a long-lived cache went stale mid-flight, self-heal once.
+        if not _looks_like_gen_py_corruption(exc):
+            raise
+        _purge_gen_py_cache()
+        if hasattr(_THREAD_LOCAL, "app"):
+            del _THREAD_LOCAL.app
+        app = get_application()
+        return app.GetNamespace("MAPI")
 
 
 def get_default_folder(folder_id: int) -> Any:
