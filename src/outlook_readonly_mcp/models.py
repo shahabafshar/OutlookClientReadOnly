@@ -133,3 +133,23 @@ class AccountInfo(BaseModel):
     smtp_address: Optional[str] = None
     account_type: Optional[int] = None
     delivery_store_name: Optional[str] = None
+
+
+class DraftResult(BaseModel):
+    """Result of creating an UNSENT draft.
+
+    `sent` is always False — the server verifies the created item reports
+    itself unsent and is sitting in the Drafts folder before returning, and
+    aborts otherwise. The live COM MailItem is never exposed; only this data
+    model leaves the writer module.
+    """
+
+    entry_id: str
+    store_id: str
+    subject: str = ""
+    folder: str = ""
+    to: list[str] = Field(default_factory=list)
+    cc: list[str] = Field(default_factory=list)
+    bcc: list[str] = Field(default_factory=list)
+    sent: bool = False
+    created: bool = True

@@ -1,16 +1,29 @@
-"""Safety constants for the read-only Outlook MCP server.
+"""Safety constants for the Outlook MCP server.
 
 This module declares the complete set of Outlook / COM symbols this server
-is forbidden from ever using. The accompanying test
+is forbidden from using. The accompanying test
 `tests/test_safety_no_writes.py` scans every source file under `src/` and
 fails CI if any forbidden symbol is referenced.
 
 The forbidden set covers anything that could mutate Outlook state: send,
 delete, save, move/copy, mark-as-read, reply, forward, print, create-item,
-display (which can flip UnRead), and direct collection mutations.
+display (which can flip UnRead), low-level MAPI writes, and direct
+collection mutations.
+
+Draft creation (optional, env-gated) is the *only* write the server can
+perform, and it is confined to a single module — `tools/drafts.py`. That one
+file is granted a tiny carve-out (`CreateItem`, `Save`, and the property
+setters needed to compose a draft) via `forbidden_calls_for()` /
+`forbidden_properties_for()`. Crucially, the carve-out does NOT include any
+symbol in `SEND_FAMILY`: send, submit, reply, forward, move, display, etc.
+remain forbidden in drafts.py exactly as everywhere else. The scan therefore
+statically proves that no source file — drafts.py included — can transition a
+draft from Drafts to a sent state.
 """
 
 from __future__ import annotations
+
+import os
 
 # Methods on MailItem / AppointmentItem / ContactItem / TaskItem / NoteItem
 # that mutate state. Includes anything Outlook treats as a write or that
@@ -41,6 +54,11 @@ FORBIDDEN_METHODS: frozenset[str] = frozenset({
     "AddSearchFolder",
     # account / store changes
     "DeliverNow", "SynchronizeBookings",
+    # low-level MAPI writes (PropertyAccessor.SetProperty* can set submit flags)
+    "SetProperty", "SetProperties",
+    # UI / automation paths that could trigger a send (inspector + ribbon +
+    # synthetic keystrokes), and the Actions/Execute reply-forward pipeline
+    "GetInspector", "ExecuteMso", "SendKeys", "Execute", "Post",
 })
 
 # Property setters or boolean state we must never assign to. The test
@@ -68,6 +86,74 @@ FORBIDDEN_APPLICATION_METHODS: frozenset[str] = frozenset({
 ALL_FORBIDDEN: frozenset[str] = (
     FORBIDDEN_METHODS | FORBIDDEN_PROPERTIES | FORBIDDEN_APPLICATION_METHODS
 )
+
+# All symbols that can cause an email to be SENT, or are a precondition to a
+# send (UI display + ribbon + synthetic keystrokes, relocation to the Outbox,
+# the reply/forward pipeline, MAPI submit-flag writes). These are forbidden in
+# EVERY file — including the draft writer `tools/drafts.py`. This is the
+# load-bearing "can never send" guarantee: the scan proves none of these names
+# appears anywhere in source, as a method call, an assignment, or a `getattr`
+# string literal.
+SEND_FAMILY: frozenset[str] = frozenset({
+    "Send", "Submit", "DeliverNow", "SaveSentMessageFolder",
+    "Reply", "ReplyAll", "ReplyAllEx", "Forward",
+    "Post", "Execute", "ExecuteMso", "SendKeys", "GetInspector",
+    "Display", "Move", "SetProperty", "SetProperties",
+})
+
+# ---------------------------------------------------------------------------
+# Draft-writer carve-out
+# ---------------------------------------------------------------------------
+# The ONE module permitted to write. Keyed on basename so any *other* file is
+# always scanned against the full forbidden set.
+DRAFT_MODULE_BASENAME = "drafts.py"
+
+# The only mutating calls the draft writer may use: create a new item and save
+# it (Save lands the item in Drafts — it never sends). Note these are a strict
+# subset of the forbidden calls and are DISJOINT from SEND_FAMILY.
+DRAFT_ALLOWED_METHODS: frozenset[str] = frozenset({"CreateItem", "Save"})
+
+# The only properties the draft writer may assign: the fields of a draft.
+DRAFT_ALLOWED_PROPERTIES: frozenset[str] = frozenset({
+    "Subject", "Body", "HTMLBody", "To", "CC", "BCC",
+})
+
+DRAFT_ALLOWED: frozenset[str] = DRAFT_ALLOWED_METHODS | DRAFT_ALLOWED_PROPERTIES
+
+# Sanity guards on the policy itself (also asserted by the test suite): the
+# draft carve-out must never overlap the send family.
+assert DRAFT_ALLOWED.isdisjoint(SEND_FAMILY), "draft carve-out leaks a send symbol"
+assert SEND_FAMILY <= (FORBIDDEN_METHODS | FORBIDDEN_PROPERTIES), (
+    "SEND_FAMILY must be a subset of the forbidden symbols"
+)
+
+
+def _is_draft_writer(filename: str) -> bool:
+    return os.path.basename(filename) == DRAFT_MODULE_BASENAME
+
+
+def forbidden_calls_for(filename: str) -> frozenset[str]:
+    """Effective set of forbidden *call* names for a given source file.
+
+    Every file is forbidden the full method + application-method set, except
+    the draft writer, which is permitted `CreateItem` and `Save` only. The
+    send family is never removed, so it stays forbidden in drafts.py too.
+    """
+    base = FORBIDDEN_METHODS | FORBIDDEN_APPLICATION_METHODS
+    if _is_draft_writer(filename):
+        return base - DRAFT_ALLOWED_METHODS
+    return base
+
+
+def forbidden_properties_for(filename: str) -> frozenset[str]:
+    """Effective set of forbidden *assignment* targets for a given file.
+
+    The draft writer may assign the draft fields (Subject/Body/To/...); all
+    other files may assign none of the forbidden properties.
+    """
+    if _is_draft_writer(filename):
+        return FORBIDDEN_PROPERTIES - DRAFT_ALLOWED_PROPERTIES
+    return FORBIDDEN_PROPERTIES
 
 
 # Outlook constants (subset we actually use). Mirrored here so we don't

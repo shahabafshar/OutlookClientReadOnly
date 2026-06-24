@@ -1,12 +1,16 @@
 """MCP server entry point.
 
-Wires the read-only tool functions into FastMCP and runs over stdio. No
-mutating MCP tool is registered. No "write" tool name appears in the
-registration surface; the safety scan also verifies the registration list.
+Wires the tool functions into FastMCP and runs over stdio. The read tools are
+always registered. The single write tool — `create_draft` — is registered
+ONLY when the environment gate `OUTLOOK_MCP_ENABLE_DRAFTS` is set truthy; the
+server is otherwise pure read-only. Under no configuration can the server
+send, reply to, forward, move, or delete mail: those symbols are statically
+forbidden everywhere (see safety.SEND_FAMILY and tests/test_safety_no_writes).
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 from typing import Optional
@@ -20,15 +24,27 @@ from .tools import mail as mail_tools
 from .tools import tasks as task_tools
 
 
+def _drafts_enabled() -> bool:
+    """True when draft creation has been explicitly enabled via env gate."""
+    return os.environ.get("OUTLOOK_MCP_ENABLE_DRAFTS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+DRAFTS_ENABLED = _drafts_enabled()
+
+
 mcp = FastMCP(
     name="outlook-readonly",
     instructions=(
-        "Read-only access to the local Microsoft Outlook desktop client. "
-        "This server can list folders, accounts, emails, calendar events, "
-        "contacts, tasks, and notes; search them; and read attachments. "
-        "It is structurally incapable of creating, modifying, deleting, "
-        "sending, replying, forwarding, or otherwise mutating any Outlook "
-        "item. Items are never marked as read or unread."
+        "Access to the local Microsoft Outlook desktop client. This server can "
+        "list folders, accounts, emails, calendar events, contacts, tasks, and "
+        "notes; search them; and read attachments. Reads never mark items as "
+        "read or unread. It CANNOT send, reply to, forward, move, or delete "
+        "mail under any configuration. When draft creation is enabled "
+        "(OUTLOOK_MCP_ENABLE_DRAFTS=1) it can additionally create UNSENT drafts "
+        "in the Drafts folder — but even then it cannot send them; only a human "
+        "in Outlook can."
     ),
 )
 
@@ -269,39 +285,93 @@ def get_note(entry_id: str, store_id: Optional[str] = None) -> dict:
     return task_tools.get_note(entry_id=entry_id, store_id=store_id).model_dump()
 
 
+# ---- Drafts (write) — registered ONLY when the env gate is set -----------
+
+if DRAFTS_ENABLED:
+    from .tools import drafts as draft_tools
+
+    @mcp.tool()
+    def create_draft(
+        subject: str = "",
+        body: Optional[str] = None,
+        html_body: Optional[str] = None,
+        to: Optional[list[str]] = None,
+        cc: Optional[list[str]] = None,
+        bcc: Optional[list[str]] = None,
+    ) -> dict:
+        """Create an UNSENT draft email in the Drafts folder.
+
+        IMPORTANT: This server can NEVER send the draft — sending is statically
+        impossible in its source. Only a human opening Outlook can send it.
+        The draft is saved to Drafts and left there. Provide either `body`
+        (plain text) or `html_body`, not both. `to`/`cc`/`bcc` are lists of
+        addresses or "Name <addr>" strings. Attachments and reply/forward
+        drafts are not supported.
+        """
+        return draft_tools.create_draft(
+            subject=subject,
+            body=body,
+            html_body=html_body,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+        ).model_dump()
+
+
 # ---- Server info ---------------------------------------------------------
+
+# Operations that are forbidden under EVERY configuration — these never become
+# available, drafts gate or not. Mirrors safety.SEND_FAMILY in spirit.
+_ALWAYS_FORBIDDEN = [
+    "send", "submit", "reply", "reply_all", "forward", "deliver_now",
+    "delete", "move", "copy", "mark_as_read", "mark_as_unread",
+    "display", "print", "send_draft",
+]
+
 
 @mcp.tool()
 def server_info() -> dict:
     """Return server name, version, and capability summary."""
+    capabilities = [
+        "mail.list_accounts",
+        "mail.list_folders",
+        "mail.list_emails",
+        "mail.search_emails",
+        "mail.get_email",
+        "mail.list_attachments",
+        "mail.get_attachment",
+        "calendar.list_calendar_folders",
+        "calendar.list_events",
+        "calendar.get_event",
+        "contacts.list_contact_folders",
+        "contacts.list_contacts",
+        "contacts.search_contacts",
+        "contacts.get_contact",
+        "tasks.list_tasks",
+        "tasks.get_task",
+        "notes.list_notes",
+        "notes.get_note",
+    ]
+    if DRAFTS_ENABLED:
+        capabilities.append("drafts.create_draft")
+
     return {
         "name": "outlook-readonly",
         "version": __version__,
-        "read_only": True,
-        "capabilities": [
-            "mail.list_accounts",
-            "mail.list_folders",
-            "mail.list_emails",
-            "mail.search_emails",
-            "mail.get_email",
-            "mail.list_attachments",
-            "mail.get_attachment",
-            "calendar.list_calendar_folders",
-            "calendar.list_events",
-            "calendar.get_event",
-            "contacts.list_contact_folders",
-            "contacts.list_contacts",
-            "contacts.search_contacts",
-            "contacts.get_contact",
-            "tasks.list_tasks",
-            "tasks.get_task",
-            "notes.list_notes",
-            "notes.get_note",
-        ],
-        "forbidden_operations": [
-            "send", "reply", "forward", "delete", "save", "move", "copy",
-            "create", "mark_as_read", "mark_as_unread", "display", "print",
-        ],
+        # Pure read-only unless drafts have been explicitly enabled.
+        "read_only": not DRAFTS_ENABLED,
+        "drafts_enabled": DRAFTS_ENABLED,
+        # The server cannot send under ANY configuration — this is invariant.
+        "can_send": False,
+        "capabilities": capabilities,
+        "forbidden_operations": _ALWAYS_FORBIDDEN,
+        "notes": (
+            "Draft creation is "
+            + ("ENABLED" if DRAFTS_ENABLED else "disabled")
+            + ". Even when enabled, the server can only save UNSENT drafts to "
+            "the Drafts folder; it can never send, and only a human in Outlook "
+            "can send a draft."
+        ),
     }
 
 

@@ -7,6 +7,7 @@ with Outlook running to validate the read paths.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
@@ -90,3 +91,50 @@ def test_get_email_roundtrip_preserves_unread_flag() -> None:
     again = mail.list_emails(limit=1)
     assert again and again[0].entry_id == s.entry_id
     assert again[0].unread == before_unread, "UnRead flag must not change on read"
+
+
+# ---------------------------------------------------------------------------
+# Live draft creation — DOUBLE-gated and skipped by default.
+#
+# This actually creates a draft in your mailbox, and the server CANNOT delete
+# it (Delete is forbidden). So it only runs when you explicitly opt in with
+# BOTH env vars, and it prints the new EntryID so you can remove it by hand.
+# ---------------------------------------------------------------------------
+
+_DRAFT_TEST_ENABLED = (
+    os.environ.get("OUTLOOK_MCP_ENABLE_DRAFTS", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+    and os.environ.get("OUTLOOK_MCP_TEST_CREATE_DRAFT", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+draft_test_required = pytest.mark.skipif(
+    not (_outlook_available() and _DRAFT_TEST_ENABLED),
+    reason=(
+        "Live draft test is opt-in. Set OUTLOOK_MCP_ENABLE_DRAFTS=1 and "
+        "OUTLOOK_MCP_TEST_CREATE_DRAFT=1 to run it (creates a real draft you "
+        "must delete manually)."
+    ),
+)
+
+
+@draft_test_required
+def test_create_draft_lands_unsent_in_drafts(capsys) -> None:
+    from outlook_readonly_mcp.tools import drafts
+
+    result = drafts.create_draft(
+        subject="[outlook-readonly-mcp self-test] safe to delete",
+        body="This unsent draft was created by the MCP test suite.",
+        to=["nobody@example.invalid"],
+    )
+    # The guarantee: created, unsent, sitting in Drafts.
+    assert result.created is True
+    assert result.sent is False
+    assert result.entry_id
+    assert "draft" in (result.folder or "").lower()
+
+    with capsys.disabled():
+        print(
+            f"\n[draft self-test] created UNSENT draft EntryID={result.entry_id} "
+            f"in folder {result.folder!r}. Delete it manually in Outlook."
+        )
