@@ -1,54 +1,152 @@
-"""Draft creation — the ONLY module in this server permitted to write.
+"""Draft management — the ONLY module in this server permitted to write.
 
-What this module may do (and nothing more): create a new `MailItem`, set the
-draft fields, and `Save()` it into the Drafts folder.
+Operations (all confined to UNSENT drafts in the Drafts folder):
+  - create_draft            : compose and save a new unsent draft
+  - update_draft            : edit fields of an existing draft
+  - delete_draft            : remove a draft (-> Deleted Items, recoverable)
+  - add_draft_attachment    : attach a file to a draft
+  - remove_draft_attachment : detach an attachment from a draft
 
-What this module is *statically forbidden* from doing — enforced by the AST
-scan in `tests/test_safety_no_writes.py`, which scans this file against the
-full forbidden set minus only `{CreateItem, Save, Subject, Body, HTMLBody,
-To, CC, BCC}`:
+Two layers of safety
+--------------------
+1. STATIC (can never send). This file is scanned (tests/test_safety_no_writes)
+   against the full forbidden set minus only
+   `{CreateItem, Save, Delete, Add, Remove, Subject, Body, HTMLBody, To, CC,
+   BCC}`. Every symbol in `safety.SEND_FAMILY` — Send, Submit, DeliverNow,
+   Reply*, Forward, Move, Display, GetInspector, ExecuteMso, SendKeys, Execute,
+   Post, SetProperty* — stays forbidden here too, including `getattr("Send")`
+   tricks. A draft therefore can never be sent or moved to the Outbox by this
+   server. (Outlook only sends from the Outbox; we have no path there.)
 
-    Send, Submit, DeliverNow, SaveSentMessageFolder, Reply, ReplyAll,
-    ReplyAllEx, Forward, Move, Display, GetInspector, ExecuteMso, SendKeys,
-    Execute, Post, SetProperty, SetProperties, Delete, Copy, ...
+2. RUNTIME (only ever touch drafts). `Delete`/`Add`/`Remove` are generic
+   mutators, so the static scan no longer proves we mutate *only* drafts. That
+   is enforced by `_resolve_editable_draft`: it resolves the item by EntryID
+   and refuses anything that is not an UNSENT item physically located in the
+   Drafts folder. Every mutating op below calls it first, so the server can
+   never edit or delete a sent message, a received mail, or any non-draft item.
 
-i.e. every symbol in `safety.SEND_FAMILY` remains forbidden here. The scan
-also rejects any `getattr(x, "Send")`-style dynamic lookup of those names.
-
-Why this means the server can never send
-----------------------------------------
-A draft becomes a sent message only when something calls a send-family method
-that moves it Drafts -> Outbox. Outlook's send pipeline drains only the
-Outbox; it never auto-sends items in Drafts. Since no send-family symbol can
-appear in this (or any) source file, and the only mutating calls available
-here are CreateItem + Save (which land the item in Drafts), a draft created
-here stays a draft.
-
-Containment: the live COM `MailItem` never leaves this function. Callers
-receive a plain `DraftResult` data model, so no caller can invoke `.Send()`
-on it either.
-
-Honest limit: once the draft exists it is an ordinary Outlook item. A human
-(or other software) can open Outlook and send it. This module guarantees the
-*server* cannot send; it cannot make the draft itself unsendable — Outlook
-offers no such thing.
+Honest limits
+-------------
+- A draft, once created, is an ordinary Outlook item. A human can open Outlook
+  and send it. This module guarantees the *server* cannot send.
+- `delete_draft` moves the item to Deleted Items (recoverable), it does not
+  permanently destroy it (`PermanentlyDelete` stays forbidden).
+- The live COM item never leaves a function; callers only receive plain models.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import os
+from typing import Any, Optional
 
 from .. import outlook
-from ..models import DraftResult
+from ..converters import attachment_info_list
+from ..models import AttachmentInfo, DraftDeleteResult, DraftResult
 from ..safety import OlDefaultFolders, OlItemType
+
+# Sentinel distinguishing "leave this field unchanged" from "set to empty".
+_UNCHANGED = object()
+
+
+class NotAnEditableDraftError(RuntimeError):
+    """Raised when a target item is not an unsent draft in the Drafts folder."""
 
 
 def _join_recipients(values: Optional[list[str]]) -> str:
     if not values:
         return ""
-    cleaned = [v.strip() for v in values if v and v.strip()]
-    return "; ".join(cleaned)
+    return "; ".join(v.strip() for v in values if v and v.strip())
 
+
+def _drafts_entry_id_for_item(item: Any) -> str:
+    """EntryID of the Drafts default folder of the item's own store."""
+    parent = item.Parent
+    store = getattr(parent, "Store", None) if parent is not None else None
+    if store is None:
+        return ""
+    drafts = store.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
+    return getattr(drafts, "EntryID", "") or ""
+
+
+def _resolve_editable_draft(entry_id: str, store_id: Optional[str]) -> Any:
+    """Resolve an item by EntryID and verify it is an editable draft.
+
+    Refuses (raises NotAnEditableDraftError) unless ALL hold:
+      - the item is a mail item (IPM.Note)
+      - it reports Sent == False
+      - it physically lives in the Drafts default folder of its own store
+
+    This is the runtime guarantee that edit/delete/attachment operations can
+    only ever affect unsent drafts — never sent or received mail.
+    """
+    if not entry_id:
+        raise ValueError("entry_id is required")
+
+    item = outlook.get_item_by_entry_id(entry_id, store_id)
+
+    message_class = getattr(item, "MessageClass", "") or ""
+    if not message_class.startswith("IPM.Note"):
+        raise NotAnEditableDraftError(
+            f"Item is not a mail item (MessageClass={message_class!r}); refusing."
+        )
+
+    if bool(getattr(item, "Sent", True)):
+        raise NotAnEditableDraftError(
+            "Item reports Sent=True; only UNSENT drafts may be modified or "
+            "deleted. Refusing."
+        )
+
+    parent = item.Parent
+    parent_entry_id = getattr(parent, "EntryID", "") or "" if parent is not None else ""
+    drafts_entry_id = _drafts_entry_id_for_item(item)
+    if not drafts_entry_id or parent_entry_id != drafts_entry_id:
+        parent_name = getattr(parent, "Name", "") if parent is not None else ""
+        raise NotAnEditableDraftError(
+            f"Item is in folder {parent_name!r}, not the Drafts folder; refusing "
+            "to modify or delete it."
+        )
+
+    return item
+
+
+def _draft_result(item: Any, *, created: bool = False) -> DraftResult:
+    """Build a DraftResult from a (verified) draft item — reads only."""
+    parent = item.Parent
+    parent_name = getattr(parent, "Name", "") if parent is not None else ""
+    store_id = ""
+    if parent is not None:
+        store = getattr(parent, "Store", None)
+        if store is not None:
+            store_id = getattr(store, "StoreID", "") or ""
+
+    # Defensive: never report a draft that somehow looks sent.
+    if bool(getattr(item, "Sent", False)):
+        raise RuntimeError("Aborting: item reports Sent=True, which must never "
+                           "happen for a draft.")
+
+    return DraftResult(
+        entry_id=getattr(item, "EntryID", "") or "",
+        store_id=store_id,
+        subject=getattr(item, "Subject", "") or "",
+        folder=parent_name,
+        to=_split(getattr(item, "To", "")),
+        cc=_split(getattr(item, "CC", "")),
+        bcc=_split(getattr(item, "BCC", "")),
+        attachments=attachment_info_list(item),
+        sent=False,
+        created=created,
+    )
+
+
+def _split(value: Optional[str]) -> list[str]:
+    if not value:
+        return []
+    return [p.strip() for p in str(value).replace(",", ";").split(";") if p.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Create
+# ---------------------------------------------------------------------------
 
 def create_draft(
     subject: str = "",
@@ -57,22 +155,21 @@ def create_draft(
     to: Optional[list[str]] = None,
     cc: Optional[list[str]] = None,
     bcc: Optional[list[str]] = None,
+    attachments: Optional[list[str]] = None,
 ) -> DraftResult:
-    """Create an UNSENT draft email and save it to the Drafts folder.
+    """Create an UNSENT draft and save it to the Drafts folder.
 
-    Returns a DraftResult with the new item's EntryID. Never sends. Raises if
-    the created item does not end up as an unsent item in the Drafts folder.
-
-    Attachments and reply/forward drafts are intentionally unsupported: adding
-    attachments needs `Attachments.Add` and replies need `Reply*`, all of
-    which stay forbidden. Compose body content directly instead.
+    `attachments` is a list of local file paths to attach. Provide either
+    `body` (plain text) or `html_body`, not both. Never sends; verifies the
+    saved item is unsent and in Drafts before returning.
     """
     if body is not None and html_body is not None:
         raise ValueError("Provide either body or html_body, not both.")
 
-    to_str = _join_recipients(to)
-    cc_str = _join_recipients(cc)
-    bcc_str = _join_recipients(bcc)
+    attachment_paths = _validate_attachment_paths(attachments)
+    to_str, cc_str, bcc_str = (
+        _join_recipients(to), _join_recipients(cc), _join_recipients(bcc),
+    )
 
     with outlook.com_apartment():
         app = outlook.get_application()
@@ -80,7 +177,6 @@ def create_draft(
         drafts_folder = ns.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
         drafts_entry_id = drafts_folder.EntryID
 
-        # Create + compose. The only writes in this whole server live here.
         item = app.CreateItem(OlItemType.olMailItem)
         if subject:
             item.Subject = subject
@@ -94,47 +190,140 @@ def create_draft(
             item.CC = cc_str
         if bcc_str:
             item.BCC = bcc_str
+        for path in attachment_paths:
+            item.Attachments.Add(path)
 
-        # Save -> Drafts. This does NOT send (Send would route to the Outbox).
-        item.Save()
+        item.Save()  # -> Drafts. Never sends.
 
-        # ---- Defensive read-back guards (reads only) -------------------
-        # If any of these fail we refuse to report success. We cannot delete
-        # the stray item (Delete is forbidden), but we surface the anomaly.
-        entry_id = item.EntryID or ""
-        parent = item.Parent
-        parent_name = ""
-        parent_entry_id = ""
-        store_id = ""
-        if parent is not None:
-            parent_name = getattr(parent, "Name", "") or ""
-            parent_entry_id = getattr(parent, "EntryID", "") or ""
-            store = getattr(parent, "Store", None)
-            if store is not None:
-                store_id = getattr(store, "StoreID", "") or ""
-
-        # Guard 1: the item must report itself unsent.
+        # Guards (reads only).
         if bool(getattr(item, "Sent", False)):
-            raise RuntimeError(
-                "Aborting: the created item reports Sent=True, which must never "
-                "happen for a draft."
-            )
-
-        # Guard 2: the item must be sitting in the Drafts folder, not the Outbox.
+            raise RuntimeError("Aborting: created item reports Sent=True.")
+        parent = item.Parent
+        parent_entry_id = getattr(parent, "EntryID", "") if parent is not None else ""
         if parent_entry_id != drafts_entry_id:
+            parent_name = getattr(parent, "Name", "") if parent is not None else ""
             raise RuntimeError(
-                f"Aborting: draft landed in folder {parent_name!r} rather than "
-                "Drafts. The server will not treat this as a successful draft."
+                f"Aborting: draft landed in {parent_name!r}, not Drafts."
             )
 
-        return DraftResult(
-            entry_id=entry_id,
-            store_id=store_id,
-            subject=subject,
-            folder=parent_name,
-            to=to or [],
-            cc=cc or [],
-            bcc=bcc or [],
-            sent=False,
-            created=True,
-        )
+        return _draft_result(item, created=True)
+
+
+# ---------------------------------------------------------------------------
+# Update / edit
+# ---------------------------------------------------------------------------
+
+def update_draft(
+    entry_id: str,
+    store_id: Optional[str] = None,
+    subject: Any = _UNCHANGED,
+    body: Any = _UNCHANGED,
+    html_body: Any = _UNCHANGED,
+    to: Any = _UNCHANGED,
+    cc: Any = _UNCHANGED,
+    bcc: Any = _UNCHANGED,
+) -> DraftResult:
+    """Edit fields of an existing draft. Only provided fields change.
+
+    Pass a value to set it; omit it (or pass the sentinel) to leave it as is.
+    For text fields, "" clears them; for to/cc/bcc, [] clears recipients.
+    `body` and `html_body` are mutually exclusive in a single call.
+    """
+    if body is not _UNCHANGED and html_body is not _UNCHANGED:
+        raise ValueError("Set either body or html_body in a single call, not both.")
+
+    with outlook.com_apartment():
+        item = _resolve_editable_draft(entry_id, store_id)
+
+        if subject is not _UNCHANGED:
+            item.Subject = subject or ""
+        if html_body is not _UNCHANGED:
+            item.HTMLBody = html_body or ""
+        if body is not _UNCHANGED:
+            item.Body = body or ""
+        if to is not _UNCHANGED:
+            item.To = _join_recipients(to)
+        if cc is not _UNCHANGED:
+            item.CC = _join_recipients(cc)
+        if bcc is not _UNCHANGED:
+            item.BCC = _join_recipients(bcc)
+
+        item.Save()
+        return _draft_result(item)
+
+
+# ---------------------------------------------------------------------------
+# Delete
+# ---------------------------------------------------------------------------
+
+def delete_draft(entry_id: str, store_id: Optional[str] = None) -> DraftDeleteResult:
+    """Delete a draft (moves it to Deleted Items; recoverable).
+
+    Refuses anything that is not an unsent draft in the Drafts folder.
+    """
+    with outlook.com_apartment():
+        item = _resolve_editable_draft(entry_id, store_id)
+        subject = getattr(item, "Subject", "") or ""
+        item.Delete()
+        return DraftDeleteResult(entry_id=entry_id, deleted=True, subject=subject)
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+def add_draft_attachment(
+    entry_id: str,
+    file_path: str,
+    store_id: Optional[str] = None,
+) -> DraftResult:
+    """Attach a local file to a draft, then save."""
+    paths = _validate_attachment_paths([file_path])
+    with outlook.com_apartment():
+        item = _resolve_editable_draft(entry_id, store_id)
+        item.Attachments.Add(paths[0])
+        item.Save()
+        return _draft_result(item)
+
+
+def remove_draft_attachment(
+    entry_id: str,
+    attachment_index: int,
+    store_id: Optional[str] = None,
+) -> DraftResult:
+    """Remove an attachment from a draft by 1-based index, then save."""
+    if attachment_index < 1:
+        raise ValueError("attachment_index is 1-based and must be >= 1.")
+    with outlook.com_apartment():
+        item = _resolve_editable_draft(entry_id, store_id)
+        count = item.Attachments.Count
+        if attachment_index > count:
+            raise IndexError(
+                f"attachment_index {attachment_index} out of range "
+                f"(draft has {count} attachment(s))."
+            )
+        item.Attachments.Remove(attachment_index)
+        item.Save()
+        return _draft_result(item)
+
+
+def list_draft_attachments(
+    entry_id: str,
+    store_id: Optional[str] = None,
+) -> list[AttachmentInfo]:
+    """List attachments on a draft (read-only; verifies it is a draft)."""
+    with outlook.com_apartment():
+        item = _resolve_editable_draft(entry_id, store_id)
+        return attachment_info_list(item)
+
+
+def _validate_attachment_paths(paths: Optional[list[str]]) -> list[str]:
+    out: list[str] = []
+    for p in paths or []:
+        if not p or not p.strip():
+            continue
+        full = os.path.abspath(p)
+        if not os.path.isfile(full):
+            raise FileNotFoundError(f"Attachment file not found: {p}")
+        out.append(full)
+    return out

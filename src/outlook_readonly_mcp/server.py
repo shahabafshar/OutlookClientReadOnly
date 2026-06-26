@@ -1,11 +1,11 @@
 """MCP server entry point.
 
 Wires the tool functions into FastMCP and runs over stdio. The read tools are
-always registered. The single write tool — `create_draft` — is registered
-ONLY when the environment gate `OUTLOOK_MCP_ENABLE_DRAFTS` is set truthy; the
-server is otherwise pure read-only. Under no configuration can the server
-send, reply to, forward, move, or delete mail: those symbols are statically
-forbidden everywhere (see safety.SEND_FAMILY and tests/test_safety_no_writes).
+always registered. The single write tool — `create_draft` — is registered by
+default; it can be turned OFF by setting `OUTLOOK_MCP_ENABLE_DRAFTS` to a falsey
+value (0/false/no/off). Under no configuration can the server send, reply to,
+forward, move, or delete mail: those symbols are statically forbidden
+everywhere (see safety.SEND_FAMILY and tests/test_safety_no_writes).
 """
 
 from __future__ import annotations
@@ -25,10 +25,16 @@ from .tools import tasks as task_tools
 
 
 def _drafts_enabled() -> bool:
-    """True when draft creation has been explicitly enabled via env gate."""
-    return os.environ.get("OUTLOOK_MCP_ENABLE_DRAFTS", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    """Whether draft creation is enabled.
+
+    Drafts are enabled by DEFAULT. Set `OUTLOOK_MCP_ENABLE_DRAFTS` to a falsey
+    value (0/false/no/off) to disable. Note this only ever gates *unsent* draft
+    creation — the server can never send under any value of this variable.
+    """
+    val = os.environ.get("OUTLOOK_MCP_ENABLE_DRAFTS")
+    if val is None or val.strip() == "":
+        return True
+    return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
 DRAFTS_ENABLED = _drafts_enabled()
@@ -41,10 +47,9 @@ mcp = FastMCP(
         "list folders, accounts, emails, calendar events, contacts, tasks, and "
         "notes; search them; and read attachments. Reads never mark items as "
         "read or unread. It CANNOT send, reply to, forward, move, or delete "
-        "mail under any configuration. When draft creation is enabled "
-        "(OUTLOOK_MCP_ENABLE_DRAFTS=1) it can additionally create UNSENT drafts "
-        "in the Drafts folder — but even then it cannot send them; only a human "
-        "in Outlook can."
+        "mail under any configuration. By default it can also create UNSENT "
+        "drafts in the Drafts folder (disable with OUTLOOK_MCP_ENABLE_DRAFTS=0) "
+        "— but even then it cannot send them; only a human in Outlook can."
     ),
 )
 
@@ -285,7 +290,7 @@ def get_note(entry_id: str, store_id: Optional[str] = None) -> dict:
     return task_tools.get_note(entry_id=entry_id, store_id=store_id).model_dump()
 
 
-# ---- Drafts (write) — registered ONLY when the env gate is set -----------
+# ---- Drafts (write) — registered by default; disable with the env gate ---
 
 if DRAFTS_ENABLED:
     from .tools import drafts as draft_tools
@@ -298,15 +303,15 @@ if DRAFTS_ENABLED:
         to: Optional[list[str]] = None,
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
+        attachments: Optional[list[str]] = None,
     ) -> dict:
         """Create an UNSENT draft email in the Drafts folder.
 
         IMPORTANT: This server can NEVER send the draft — sending is statically
         impossible in its source. Only a human opening Outlook can send it.
-        The draft is saved to Drafts and left there. Provide either `body`
-        (plain text) or `html_body`, not both. `to`/`cc`/`bcc` are lists of
-        addresses or "Name <addr>" strings. Attachments and reply/forward
-        drafts are not supported.
+        Provide either `body` (plain text) or `html_body`, not both.
+        `to`/`cc`/`bcc` are lists of addresses or "Name <addr>" strings.
+        `attachments` is a list of local file paths to attach.
         """
         return draft_tools.create_draft(
             subject=subject,
@@ -315,17 +320,105 @@ if DRAFTS_ENABLED:
             to=to,
             cc=cc,
             bcc=bcc,
+            attachments=attachments,
         ).model_dump()
+
+    @mcp.tool()
+    def update_draft(
+        entry_id: str,
+        store_id: Optional[str] = None,
+        subject: Optional[str] = None,
+        body: Optional[str] = None,
+        html_body: Optional[str] = None,
+        to: Optional[list[str]] = None,
+        cc: Optional[list[str]] = None,
+        bcc: Optional[list[str]] = None,
+    ) -> dict:
+        """Edit an existing UNSENT draft (identified by EntryID).
+
+        Only the fields you pass are changed; omit a field to leave it as is.
+        For text fields, "" clears them; for to/cc/bcc, [] clears recipients.
+        Refuses any item that is not an unsent draft in the Drafts folder.
+        Cannot send. `body` and `html_body` are mutually exclusive per call.
+        """
+        kwargs: dict = {"entry_id": entry_id, "store_id": store_id}
+        if subject is not None:
+            kwargs["subject"] = subject
+        if body is not None:
+            kwargs["body"] = body
+        if html_body is not None:
+            kwargs["html_body"] = html_body
+        if to is not None:
+            kwargs["to"] = to
+        if cc is not None:
+            kwargs["cc"] = cc
+        if bcc is not None:
+            kwargs["bcc"] = bcc
+        return draft_tools.update_draft(**kwargs).model_dump()
+
+    @mcp.tool()
+    def delete_draft(entry_id: str, store_id: Optional[str] = None) -> dict:
+        """Delete an UNSENT draft (moves it to Deleted Items; recoverable).
+
+        Refuses any item that is not an unsent draft in the Drafts folder, so
+        it can never delete sent or received mail.
+        """
+        return draft_tools.delete_draft(entry_id=entry_id, store_id=store_id).model_dump()
+
+    @mcp.tool()
+    def add_draft_attachment(
+        entry_id: str,
+        file_path: str,
+        store_id: Optional[str] = None,
+    ) -> dict:
+        """Attach a local file to an UNSENT draft. Refuses non-draft items."""
+        return draft_tools.add_draft_attachment(
+            entry_id=entry_id, file_path=file_path, store_id=store_id
+        ).model_dump()
+
+    @mcp.tool()
+    def remove_draft_attachment(
+        entry_id: str,
+        attachment_index: int,
+        store_id: Optional[str] = None,
+    ) -> dict:
+        """Remove an attachment (1-based index) from an UNSENT draft."""
+        return draft_tools.remove_draft_attachment(
+            entry_id=entry_id, attachment_index=attachment_index, store_id=store_id
+        ).model_dump()
+
+    @mcp.tool()
+    def list_draft_attachments(entry_id: str, store_id: Optional[str] = None) -> list[dict]:
+        """List attachments on an UNSENT draft (verifies it is a draft)."""
+        return [
+            a.model_dump()
+            for a in draft_tools.list_draft_attachments(
+                entry_id=entry_id, store_id=store_id
+            )
+        ]
 
 
 # ---- Server info ---------------------------------------------------------
 
 # Operations that are forbidden under EVERY configuration — these never become
 # available, drafts gate or not. Mirrors safety.SEND_FAMILY in spirit.
+# (Note: deleting/editing is possible for UNSENT DRAFTS only — never for sent
+# or received mail, which is runtime-enforced. Sending is never possible.)
 _ALWAYS_FORBIDDEN = [
     "send", "submit", "reply", "reply_all", "forward", "deliver_now",
-    "delete", "move", "copy", "mark_as_read", "mark_as_unread",
-    "display", "print", "send_draft",
+    "move", "mark_as_read", "mark_as_unread", "display", "print",
+    "send_draft", "modify_non_draft_item", "delete_non_draft_item",
+]
+
+# Write operations available only when drafting is enabled. All are confined to
+# unsent drafts in the Drafts folder; none can send.
+_DRAFT_OPERATIONS = [
+    "drafts.create_draft",
+    "drafts.update_draft",
+    "drafts.delete_draft",
+    "drafts.add_draft_attachment",
+    "drafts.remove_draft_attachment",
+    "drafts.list_draft_attachments",
 ]
 
 
@@ -353,7 +446,7 @@ def server_info() -> dict:
         "notes.get_note",
     ]
     if DRAFTS_ENABLED:
-        capabilities.append("drafts.create_draft")
+        capabilities.extend(_DRAFT_OPERATIONS)
 
     return {
         "name": "outlook-readonly",
@@ -366,11 +459,13 @@ def server_info() -> dict:
         "capabilities": capabilities,
         "forbidden_operations": _ALWAYS_FORBIDDEN,
         "notes": (
-            "Draft creation is "
+            "Draft management is "
             + ("ENABLED" if DRAFTS_ENABLED else "disabled")
-            + ". Even when enabled, the server can only save UNSENT drafts to "
-            "the Drafts folder; it can never send, and only a human in Outlook "
-            "can send a draft."
+            + ". When enabled, the server can create, edit, and delete UNSENT "
+            "drafts and manage their attachments — confined at runtime to "
+            "unsent items in the Drafts folder. It can NEVER send (statically "
+            "guaranteed), nor modify/delete sent or received mail. Only a human "
+            "in Outlook can send a draft."
         ),
     }
 

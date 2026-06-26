@@ -151,5 +151,15 @@ class DraftResult(BaseModel):
     to: list[str] = Field(default_factory=list)
     cc: list[str] = Field(default_factory=list)
     bcc: list[str] = Field(default_factory=list)
+    attachments: list[AttachmentInfo] = Field(default_factory=list)
     sent: bool = False
     created: bool = True
+
+
+class DraftDeleteResult(BaseModel):
+    """Result of deleting a draft. The item is moved to Deleted Items (it is
+    recoverable there) — it is never permanently destroyed."""
+
+    entry_id: str
+    deleted: bool = True
+    subject: str = ""

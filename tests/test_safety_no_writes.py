@@ -190,6 +190,24 @@ def test_send_family_contains_the_critical_names() -> None:
     assert DRAFT_ALLOWED.isdisjoint(SEND_FAMILY)
 
 
+def test_draft_carveout_permits_management_but_never_send() -> None:
+    """drafts.py may create/save/delete/attach — but never any send symbol.
+
+    And every newly-permitted mutator stays forbidden in all other files.
+    """
+    drafts_calls = forbidden_calls_for("drafts.py")
+    for allowed in ("CreateItem", "Save", "Delete", "Add", "Remove"):
+        assert allowed not in drafts_calls, f"{allowed} should be permitted in drafts.py"
+    for blocked in SEND_FAMILY:
+        assert blocked in drafts_calls, f"{blocked} must stay forbidden in drafts.py"
+
+    other_calls = forbidden_calls_for("mail.py")
+    for must_block in ("CreateItem", "Save", "Delete", "Add", "Remove"):
+        assert must_block in other_calls, (
+            f"{must_block} must remain forbidden outside the draft writer"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Draft writer containment
 # ---------------------------------------------------------------------------

@@ -119,22 +119,49 @@ draft_test_required = pytest.mark.skipif(
 
 
 @draft_test_required
-def test_create_draft_lands_unsent_in_drafts(capsys) -> None:
+def test_draft_full_lifecycle_self_cleaning(tmp_path) -> None:
+    """Create -> edit -> add/remove attachment -> delete. Leaves nothing behind."""
     from outlook_readonly_mcp.tools import drafts
 
+    # 1. Create an unsent draft.
     result = drafts.create_draft(
         subject="[outlook-readonly-mcp self-test] safe to delete",
-        body="This unsent draft was created by the MCP test suite.",
+        body="created by the MCP test suite",
         to=["nobody@example.invalid"],
     )
-    # The guarantee: created, unsent, sitting in Drafts.
-    assert result.created is True
-    assert result.sent is False
-    assert result.entry_id
+    assert result.created is True and result.sent is False and result.entry_id
     assert "draft" in (result.folder or "").lower()
+    eid, sid = result.entry_id, result.store_id
 
-    with capsys.disabled():
-        print(
-            f"\n[draft self-test] created UNSENT draft EntryID={result.entry_id} "
-            f"in folder {result.folder!r}. Delete it manually in Outlook."
-        )
+    try:
+        # 2. Edit it.
+        edited = drafts.update_draft(eid, store_id=sid, subject="edited subject", cc=["cc@example.invalid"])
+        assert edited.subject == "edited subject"
+        assert edited.sent is False
+
+        # 3. Add an attachment.
+        att = tmp_path / "note.txt"
+        att.write_text("attachment body", encoding="utf-8")
+        with_att = drafts.add_draft_attachment(eid, str(att), store_id=sid)
+        assert len(with_att.attachments) == 1
+        assert with_att.attachments[0].filename == "note.txt"
+
+        # 4. Remove the attachment.
+        without = drafts.remove_draft_attachment(eid, 1, store_id=sid)
+        assert without.attachments == []
+
+        # 5. Guard: refuse to edit a non-draft (a real Inbox item).
+        inbox = mail_module().list_emails(limit=1)
+        if inbox:
+            with pytest.raises(Exception):
+                drafts.update_draft(inbox[0].entry_id, store_id=inbox[0].store_id, subject="x")
+    finally:
+        # 6. Delete the draft we created — cleanup, no artifact left.
+        deleted = drafts.delete_draft(eid, store_id=sid)
+        assert deleted.deleted is True
+
+
+def mail_module():
+    from outlook_readonly_mcp.tools import mail
+
+    return mail

@@ -1,8 +1,8 @@
 {
   "extensionId": "cyrus-build.cyrus-missions",
-  "extensionVersion": "1.3.0",
+  "extensionVersion": "1.4.3",
   "ide": "Visual Studio Code",
-  "ideVersion": "1.125.1",
+  "ideVersion": "1.126.0",
   "platform": "win32",
   "arch": "x64",
   "nodeVersion": "v24.15.0",
@@ -14,5 +14,5 @@
     "cli": "claude",
     "model": null
   },
-  "writtenAt": "2026-06-24T18:20:01.672Z"
+  "writtenAt": "2026-06-24T21:23:08.588Z"
 }

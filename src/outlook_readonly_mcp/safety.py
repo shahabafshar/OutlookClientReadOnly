@@ -108,10 +108,24 @@ SEND_FAMILY: frozenset[str] = frozenset({
 # always scanned against the full forbidden set.
 DRAFT_MODULE_BASENAME = "drafts.py"
 
-# The only mutating calls the draft writer may use: create a new item and save
-# it (Save lands the item in Drafts — it never sends). Note these are a strict
-# subset of the forbidden calls and are DISJOINT from SEND_FAMILY.
-DRAFT_ALLOWED_METHODS: frozenset[str] = frozenset({"CreateItem", "Save"})
+# The mutating calls the draft writer may use. ALL of these are disjoint from
+# SEND_FAMILY, so permitting them in drafts.py does not weaken the can-never-
+# send guarantee one bit (Move/Send/Submit/Reply*/Forward all stay forbidden):
+#   CreateItem  - make a new mail item
+#   Save        - persist to Drafts (never sends; Send would route to Outbox)
+#   Delete      - remove a draft (runtime-guarded to drafts only; recoverable
+#                 via Deleted Items)
+#   Add         - add an attachment to a draft (Attachments.Add)
+#   Remove      - remove an attachment from a draft (Attachments.Remove)
+#
+# IMPORTANT: Delete/Add/Remove are generic mutators. The static scan no longer
+# proves drafts.py only mutates *drafts* — that is enforced at RUNTIME by
+# `tools/drafts._resolve_editable_draft`, which refuses any item that is not an
+# unsent item physically in the Drafts folder. Edit/delete/attachment ops MUST
+# go through that guard.
+DRAFT_ALLOWED_METHODS: frozenset[str] = frozenset({
+    "CreateItem", "Save", "Delete", "Add", "Remove",
+})
 
 # The only properties the draft writer may assign: the fields of a draft.
 DRAFT_ALLOWED_PROPERTIES: frozenset[str] = frozenset({
