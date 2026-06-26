@@ -114,10 +114,12 @@ def _draft_result(item: Any, *, created: bool = False) -> DraftResult:
     parent = item.Parent
     parent_name = getattr(parent, "Name", "") if parent is not None else ""
     store_id = ""
+    account_name = ""
     if parent is not None:
         store = getattr(parent, "Store", None)
         if store is not None:
             store_id = getattr(store, "StoreID", "") or ""
+            account_name = getattr(store, "DisplayName", "") or ""
 
     # Defensive: never report a draft that somehow looks sent.
     if bool(getattr(item, "Sent", False)):
@@ -127,6 +129,7 @@ def _draft_result(item: Any, *, created: bool = False) -> DraftResult:
     return DraftResult(
         entry_id=getattr(item, "EntryID", "") or "",
         store_id=store_id,
+        account=account_name,
         subject=getattr(item, "Subject", "") or "",
         folder=parent_name,
         to=_split(getattr(item, "To", "")),
@@ -148,6 +151,41 @@ def _split(value: Optional[str]) -> list[str]:
 # Create
 # ---------------------------------------------------------------------------
 
+def _resolve_drafts_folder(ns: Any, account: Optional[str]) -> Any:
+    """Return the Drafts default folder for the requested account.
+
+    `account` may be an SMTP address or an account/store display name (e.g.
+    "safshar@iastate.edu"). None selects the default store's Drafts. Raises if
+    no match is found — we never silently fall back to a different mailbox than
+    the caller asked for (that is exactly the "wrong account" bug this guards
+    against). All operations here are reads; no item is moved.
+    """
+    if not account or not account.strip():
+        return ns.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
+    target = account.strip().lower()
+
+    accounts = ns.Accounts
+    for i in range(accounts.Count):
+        acc = accounts.Item(i + 1)
+        smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+        disp = (getattr(acc, "DisplayName", "") or "").lower()
+        if target in (smtp, disp):
+            store = getattr(acc, "DeliveryStore", None)
+            if store is not None:
+                return store.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
+
+    stores = ns.Stores
+    for i in range(stores.Count):
+        st = stores.Item(i + 1)
+        if (getattr(st, "DisplayName", "") or "").lower() == target:
+            return st.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
+
+    raise ValueError(
+        f"No Outlook account or store matches {account!r}; refusing to guess a "
+        "mailbox. Use list_accounts to see valid names."
+    )
+
+
 def create_draft(
     subject: str = "",
     body: Optional[str] = None,
@@ -156,12 +194,16 @@ def create_draft(
     cc: Optional[list[str]] = None,
     bcc: Optional[list[str]] = None,
     attachments: Optional[list[str]] = None,
+    account: Optional[str] = None,
 ) -> DraftResult:
-    """Create an UNSENT draft and save it to the Drafts folder.
+    """Create an UNSENT draft and save it to a Drafts folder.
 
-    `attachments` is a list of local file paths to attach. Provide either
-    `body` (plain text) or `html_body`, not both. Never sends; verifies the
-    saved item is unsent and in Drafts before returning.
+    `account` selects which mailbox's Drafts folder to use (SMTP address or
+    account display name, e.g. "safshar@iastate.edu"); None uses the default
+    store. `attachments` is a list of local file paths. Provide either `body`
+    (plain text) or `html_body`, not both. Never sends; the item is created
+    directly in the target Drafts folder (via Items.Add — no Move is used),
+    and verified unsent and in Drafts before returning.
     """
     if body is not None and html_body is not None:
         raise ValueError("Provide either body or html_body, not both.")
@@ -174,10 +216,13 @@ def create_draft(
     with outlook.com_apartment():
         app = outlook.get_application()
         ns = app.GetNamespace("MAPI")
-        drafts_folder = ns.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
+        drafts_folder = _resolve_drafts_folder(ns, account)
         drafts_entry_id = drafts_folder.EntryID
 
-        item = app.CreateItem(OlItemType.olMailItem)
+        # Born directly in the target account's Drafts. Items.Add (permitted
+        # in this module) means the draft starts life in the correct mailbox,
+        # so no Move (forbidden) is ever needed to relocate it.
+        item = drafts_folder.Items.Add("IPM.Note")
         if subject:
             item.Subject = subject
         if html_body is not None:

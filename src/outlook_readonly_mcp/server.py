@@ -304,12 +304,15 @@ if DRAFTS_ENABLED:
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
         attachments: Optional[list[str]] = None,
+        account: Optional[str] = None,
     ) -> dict:
-        """Create an UNSENT draft email in the Drafts folder.
+        """Create an UNSENT draft email in a Drafts folder.
 
         IMPORTANT: This server can NEVER send the draft — sending is statically
         impossible in its source. Only a human opening Outlook can send it.
-        Provide either `body` (plain text) or `html_body`, not both.
+        `account` selects which mailbox's Drafts to use (SMTP address or
+        account display name, e.g. "safshar@iastate.edu"); omit for the default
+        store. Provide either `body` (plain text) or `html_body`, not both.
         `to`/`cc`/`bcc` are lists of addresses or "Name <addr>" strings.
         `attachments` is a list of local file paths to attach.
         """
@@ -321,6 +324,7 @@ if DRAFTS_ENABLED:
             cc=cc,
             bcc=bcc,
             attachments=attachments,
+            account=account,
         ).model_dump()
 
     @mcp.tool()

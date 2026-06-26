@@ -146,6 +146,7 @@ class DraftResult(BaseModel):
 
     entry_id: str
     store_id: str
+    account: str = ""
     subject: str = ""
     folder: str = ""
     to: list[str] = Field(default_factory=list)
