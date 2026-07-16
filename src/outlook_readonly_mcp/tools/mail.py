@@ -21,6 +21,7 @@ from ..models import (
     AttachmentContent,
     AttachmentInfo,
     EmailDetail,
+    EmailPage,
     EmailSummary,
     FolderInfo,
 )
@@ -61,10 +62,26 @@ def list_folders(max_depth: int = 4) -> list[FolderInfo]:
         return results
 
 
-def _resolve_folder(folder_path: Optional[str], default_id: int):
-    if folder_path:
-        return outlook.find_folder_by_path(folder_path)
-    return outlook.get_default_folder(default_id)
+def _resolve_folder(
+    folder: Optional[str],
+    account: Optional[str],
+    default_id: int,
+):
+    """Resolve the query scope. Raises FolderResolutionError on any miss —
+    there is deliberately no fallback to the default inbox."""
+    return outlook.resolve_mail_folder(
+        folder=folder, account=account, default_folder_id=default_id
+    )
+
+
+def _store_name_of(folder) -> str:
+    try:
+        store = folder.Store
+        if store is not None:
+            return getattr(store, "DisplayName", "") or ""
+    except Exception:
+        pass
+    return ""
 
 
 def _escape_dasl_string(s: str) -> str:
@@ -72,7 +89,8 @@ def _escape_dasl_string(s: str) -> str:
 
 
 def list_emails(
-    folder_path: Optional[str] = None,
+    folder: Optional[str] = None,
+    account: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     unread_only: bool = False,
@@ -81,8 +99,17 @@ def list_emails(
     subject_contains: Optional[str] = None,
     received_after: Optional[datetime] = None,
     received_before: Optional[datetime] = None,
-) -> list[EmailSummary]:
-    """List emails in a folder (Inbox by default) with optional filters.
+    folder_path: Optional[str] = None,
+) -> EmailPage:
+    """List emails in a folder with optional filters.
+
+    `folder` accepts a well-known name ('Inbox', 'Sent Items', 'Drafts', ...),
+    a full path ('\\\\store\\folder\\sub'), or a folder EntryID; `account`
+    scopes name lookups to that mailbox's store. Defaults to the Inbox of the
+    account's store (or the default store). If the folder or account cannot be
+    resolved this raises — it never silently queries a different folder. The
+    returned EmailPage echoes `resolved_folder` so callers can verify scope.
+    `folder_path` is a deprecated alias for `folder`.
 
     All filters are evaluated by Outlook via `Items.Restrict` (DASL) where
     possible, with the remainder applied client-side. No item is modified.
@@ -91,10 +118,14 @@ def list_emails(
         raise ValueError("limit must be in (0, 1000]")
     if offset < 0:
         raise ValueError("offset must be >= 0")
+    if folder is None and folder_path:
+        folder = folder_path
 
     with outlook.com_apartment():
-        folder = _resolve_folder(folder_path, OlDefaultFolders.olFolderInbox)
-        items = folder.Items
+        target = _resolve_folder(folder, account, OlDefaultFolders.olFolderInbox)
+        resolved_path = outlook.folder_path_of(target)
+        resolved_store = _store_name_of(target)
+        items = target.Items
         try:
             items.Sort("[ReceivedTime]", True)
         except Exception:
@@ -159,29 +190,43 @@ def list_emails(
             if taken >= limit:
                 break
             idx += 1
-        return out
+        return EmailPage(
+            resolved_folder=resolved_path,
+            resolved_store=resolved_store,
+            count=len(out),
+            emails=out,
+        )
 
 
 def search_emails(
     query: str,
-    folder_path: Optional[str] = None,
+    folder: Optional[str] = None,
+    account: Optional[str] = None,
     limit: int = 50,
     scope: str = "subject_and_sender",
-) -> list[EmailSummary]:
+    folder_path: Optional[str] = None,
+) -> EmailPage:
     """Phrase-match search over a folder.
 
+    `folder`/`account` resolve exactly as in list_emails (well-known name,
+    full path, or EntryID; scoped to the account's store; error on any miss —
+    never a silent fallback). Defaults to the Inbox of the target store.
     scope is one of: 'subject_only', 'sender_only', 'subject_and_sender',
     'body', 'all'. Body and all-scope searches are slower as they touch
-    every item's body.
+    every item's body. `folder_path` is a deprecated alias for `folder`.
     """
     if limit <= 0 or limit > 500:
         raise ValueError("limit must be in (0, 500]")
     if not query.strip():
         raise ValueError("query must not be empty")
+    if folder is None and folder_path:
+        folder = folder_path
 
     with outlook.com_apartment():
-        folder = _resolve_folder(folder_path, OlDefaultFolders.olFolderInbox)
-        items = folder.Items
+        target = _resolve_folder(folder, account, OlDefaultFolders.olFolderInbox)
+        resolved_path = outlook.folder_path_of(target)
+        resolved_store = _store_name_of(target)
+        items = target.Items
         try:
             items.Sort("[ReceivedTime]", True)
         except Exception:
@@ -240,7 +285,12 @@ def search_emails(
             out.append(email_summary(item))
             if len(out) >= limit:
                 break
-        return out
+        return EmailPage(
+            resolved_folder=resolved_path,
+            resolved_store=resolved_store,
+            count=len(out),
+            emails=out,
+        )
 
 
 def get_email(entry_id: str, store_id: Optional[str] = None) -> EmailDetail:

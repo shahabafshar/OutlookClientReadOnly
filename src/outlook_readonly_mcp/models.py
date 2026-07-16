@@ -135,6 +135,20 @@ class AccountInfo(BaseModel):
     delivery_store_name: Optional[str] = None
 
 
+class EmailPage(BaseModel):
+    """Envelope for list/search results.
+
+    `resolved_folder` echoes the canonical path of the folder that was
+    actually queried (e.g. '\\\\zfard@iastate.edu\\Sent Items') so callers can
+    verify scoping instead of trusting it blindly.
+    """
+
+    resolved_folder: str
+    resolved_store: str = ""
+    count: int = 0
+    emails: list[EmailSummary] = Field(default_factory=list)
+
+
 class DraftResult(BaseModel):
     """Result of creating an UNSENT draft.
 

@@ -155,35 +155,15 @@ def _resolve_drafts_folder(ns: Any, account: Optional[str]) -> Any:
     """Return the Drafts default folder for the requested account.
 
     `account` may be an SMTP address or an account/store display name (e.g.
-    "safshar@iastate.edu"). None selects the default store's Drafts. Raises if
-    no match is found — we never silently fall back to a different mailbox than
-    the caller asked for (that is exactly the "wrong account" bug this guards
-    against). All operations here are reads; no item is moved.
+    "safshar@iastate.edu"). None selects the default store's Drafts. Delegates
+    to the shared `outlook.resolve_store` (the same resolver used by the mail
+    list/search tools), which raises rather than guessing a mailbox. Reads
+    only; no item is moved.
     """
     if not account or not account.strip():
         return ns.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
-    target = account.strip().lower()
-
-    accounts = ns.Accounts
-    for i in range(accounts.Count):
-        acc = accounts.Item(i + 1)
-        smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
-        disp = (getattr(acc, "DisplayName", "") or "").lower()
-        if target in (smtp, disp):
-            store = getattr(acc, "DeliveryStore", None)
-            if store is not None:
-                return store.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
-
-    stores = ns.Stores
-    for i in range(stores.Count):
-        st = stores.Item(i + 1)
-        if (getattr(st, "DisplayName", "") or "").lower() == target:
-            return st.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
-
-    raise ValueError(
-        f"No Outlook account or store matches {account!r}; refusing to guess a "
-        "mailbox. Use list_accounts to see valid names."
-    )
+    store = outlook.resolve_store(ns, account)
+    return store.GetDefaultFolder(OlDefaultFolders.olFolderDrafts)
 
 
 def create_draft(

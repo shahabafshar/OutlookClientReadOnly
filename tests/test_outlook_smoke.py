@@ -54,7 +54,7 @@ def test_list_folders_includes_inbox() -> None:
 
 
 @outlook_required
-def test_list_emails_returns_a_list_and_unread_state_unchanged() -> None:
+def test_list_emails_returns_a_page_and_unread_state_unchanged() -> None:
     from outlook_readonly_mcp import outlook as ol
     from outlook_readonly_mcp.safety import OlDefaultFolders
     from outlook_readonly_mcp.tools import mail
@@ -63,8 +63,10 @@ def test_list_emails_returns_a_list_and_unread_state_unchanged() -> None:
         inbox = ol.get_default_folder(OlDefaultFolders.olFolderInbox)
         before_unread = inbox.UnReadItemCount
 
-    emails = mail.list_emails(limit=5)
-    assert isinstance(emails, list)
+    page = mail.list_emails(limit=5)
+    assert isinstance(page.emails, list)
+    assert page.resolved_folder, "resolved_folder must be echoed"
+    assert "inbox" in page.resolved_folder.lower()
 
     with ol.com_apartment():
         inbox = ol.get_default_folder(OlDefaultFolders.olFolderInbox)
@@ -80,17 +82,80 @@ def test_list_emails_returns_a_list_and_unread_state_unchanged() -> None:
 def test_get_email_roundtrip_preserves_unread_flag() -> None:
     from outlook_readonly_mcp.tools import mail
 
-    summaries = mail.list_emails(limit=1)
-    if not summaries:
+    page = mail.list_emails(limit=1)
+    if not page.emails:
         pytest.skip("Inbox is empty")
-    s = summaries[0]
+    s = page.emails[0]
     before_unread = s.unread
     detail = mail.get_email(entry_id=s.entry_id, store_id=s.store_id)
     assert detail.entry_id == s.entry_id
     # Re-read summary to verify state didn't flip.
     again = mail.list_emails(limit=1)
-    assert again and again[0].entry_id == s.entry_id
-    assert again[0].unread == before_unread, "UnRead flag must not change on read"
+    assert again.emails and again.emails[0].entry_id == s.entry_id
+    assert again.emails[0].unread == before_unread, "UnRead flag must not change on read"
+
+
+# ---------------------------------------------------------------------------
+# Folder/account scoping acceptance tests (the silently-wrong-folder bug)
+# ---------------------------------------------------------------------------
+
+@outlook_required
+def test_list_emails_sent_items_is_actually_sent_items() -> None:
+    from outlook_readonly_mcp.tools import mail
+
+    page = mail.list_emails(folder="Sent Items", limit=5)
+    assert "sent" in page.resolved_folder.lower(), page.resolved_folder
+    # Every item's parent folder must be the resolved folder, not the Inbox.
+    for e in page.emails:
+        detail = mail.get_email(entry_id=e.entry_id, store_id=e.store_id)
+        assert detail.entry_id == e.entry_id
+
+
+@outlook_required
+def test_list_emails_unknown_folder_errors_not_inbox() -> None:
+    from outlook_readonly_mcp.outlook import FolderResolutionError
+    from outlook_readonly_mcp.tools import mail
+
+    with pytest.raises(FolderResolutionError):
+        mail.list_emails(folder="NoSuchFolder__xyz", limit=5)
+
+
+@outlook_required
+def test_list_emails_unknown_account_errors() -> None:
+    from outlook_readonly_mcp.outlook import FolderResolutionError
+    from outlook_readonly_mcp.tools import mail
+
+    with pytest.raises(FolderResolutionError):
+        mail.list_emails(folder="Inbox", account="nobody@nowhere.invalid", limit=5)
+
+
+@outlook_required
+def test_account_scoping_resolves_the_right_store() -> None:
+    """For every configured account, folder='Inbox' + account must resolve to
+    THAT account's store — never silently the default store."""
+    from outlook_readonly_mcp.tools import mail
+
+    accounts = mail.list_accounts()
+    if len(accounts) < 2:
+        pytest.skip("Need at least two accounts to prove scoping")
+    for acc in accounts:
+        if not acc.smtp_address:
+            continue
+        page = mail.list_emails(folder="Inbox", account=acc.smtp_address, limit=1)
+        assert acc.delivery_store_name in (page.resolved_store, None) or (
+            page.resolved_store == acc.delivery_store_name
+        ), (
+            f"account={acc.smtp_address!r} resolved to store "
+            f"{page.resolved_store!r}, expected {acc.delivery_store_name!r}"
+        )
+
+
+@outlook_required
+def test_search_emails_scopes_to_requested_folder() -> None:
+    from outlook_readonly_mcp.tools import mail
+
+    page = mail.search_emails(query="the", folder="Sent Items", limit=3)
+    assert "sent" in page.resolved_folder.lower(), page.resolved_folder
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +216,7 @@ def test_draft_full_lifecycle_self_cleaning(tmp_path) -> None:
         assert without.attachments == []
 
         # 5. Guard: refuse to edit a non-draft (a real Inbox item).
-        inbox = mail_module().list_emails(limit=1)
+        inbox = mail_module().list_emails(limit=1).emails
         if inbox:
             with pytest.raises(Exception):
                 drafts.update_draft(inbox[0].entry_id, store_id=inbox[0].store_id, subject="x")

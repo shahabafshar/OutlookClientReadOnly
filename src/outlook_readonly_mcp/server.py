@@ -70,7 +70,8 @@ def list_folders(max_depth: int = 4) -> list[dict]:
 
 @mcp.tool()
 def list_emails(
-    folder_path: Optional[str] = None,
+    folder: Optional[str] = None,
+    account: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     unread_only: bool = False,
@@ -79,46 +80,62 @@ def list_emails(
     subject_contains: Optional[str] = None,
     received_after: Optional[datetime] = None,
     received_before: Optional[datetime] = None,
-) -> list[dict]:
-    """List emails in a folder (Inbox by default), newest first. All filters optional.
+    folder_path: Optional[str] = None,
+) -> dict:
+    """List emails in a folder, newest first. All filters optional.
 
-    folder_path: '/'-separated, first segment is the store/account name. Pass
-    None for the primary Inbox. Use list_folders to discover paths.
+    folder: a well-known name ('Inbox', 'Sent Items', 'Drafts', 'Deleted
+    Items', 'Outbox', 'Junk'), a full path ('\\\\store\\folder\\sub' or
+    'store/folder/sub'), or a folder EntryID from list_folders.
+    account: SMTP address or store display name (e.g. 'safshar@iastate.edu')
+    scoping name lookups to that mailbox. Defaults: the Inbox of the account's
+    store, or of the default store when both are omitted.
+    Errors (never guesses) if the folder/account cannot be resolved. The
+    response envelope echoes `resolved_folder` and `resolved_store` — check
+    them to confirm the scope you asked for. `folder_path` is a deprecated
+    alias for `folder`.
     """
-    return [
-        e.model_dump()
-        for e in mail_tools.list_emails(
-            folder_path=folder_path,
-            limit=limit,
-            offset=offset,
-            unread_only=unread_only,
-            has_attachment=has_attachment,
-            sender_contains=sender_contains,
-            subject_contains=subject_contains,
-            received_after=received_after,
-            received_before=received_before,
-        )
-    ]
+    return mail_tools.list_emails(
+        folder=folder,
+        account=account,
+        limit=limit,
+        offset=offset,
+        unread_only=unread_only,
+        has_attachment=has_attachment,
+        sender_contains=sender_contains,
+        subject_contains=subject_contains,
+        received_after=received_after,
+        received_before=received_before,
+        folder_path=folder_path,
+    ).model_dump()
 
 
 @mcp.tool()
 def search_emails(
     query: str,
-    folder_path: Optional[str] = None,
+    folder: Optional[str] = None,
+    account: Optional[str] = None,
     limit: int = 50,
     scope: str = "subject_and_sender",
-) -> list[dict]:
-    """Phrase-match search.
+    folder_path: Optional[str] = None,
+) -> dict:
+    """Phrase-match search, scoped to one folder.
 
+    folder/account resolve exactly as in list_emails (well-known name, full
+    path, or EntryID; account = SMTP address or store name). Defaults to the
+    Inbox of the target store; errors instead of guessing on any resolution
+    miss. The response echoes `resolved_folder`/`resolved_store`.
     scope: 'subject_only' | 'sender_only' | 'subject_and_sender' (default) |
     'body' | 'all'. Body/all searches are slower as they touch every body.
     """
-    return [
-        e.model_dump()
-        for e in mail_tools.search_emails(
-            query=query, folder_path=folder_path, limit=limit, scope=scope
-        )
-    ]
+    return mail_tools.search_emails(
+        query=query,
+        folder=folder,
+        account=account,
+        limit=limit,
+        scope=scope,
+        folder_path=folder_path,
+    ).model_dump()
 
 
 @mcp.tool()

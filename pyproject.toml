@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "outlook-readonly-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only MCP server for the local Microsoft Outlook desktop client. Reads and searches mail, calendar, contacts, and tasks via COM. Fundamentally incapable of creating, modifying, or deleting any item."
 readme = "README.md"
 requires-python = ">=3.10"

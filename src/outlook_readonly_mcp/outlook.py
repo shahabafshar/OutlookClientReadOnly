@@ -251,6 +251,204 @@ def find_folder_by_path(path: str) -> Any:
     return current
 
 
+# ---------------------------------------------------------------------------
+# Explicit store / folder resolution (no silent fallback — ever)
+# ---------------------------------------------------------------------------
+
+class FolderResolutionError(LookupError):
+    """The requested account/folder could not be resolved.
+
+    Raised instead of any silent fallback: returning plausible data from the
+    wrong mailbox is strictly worse than an error.
+    """
+
+
+# Well-known mail folder names -> olDefaultFolders ids. Matching by *type*
+# (GetDefaultFolder) makes these work even when the display names are
+# localized; a literal name walk below covers everything else.
+MAIL_DEFAULT_FOLDER_ALIASES: dict[str, int] = {
+    "inbox": 6,
+    "sent items": 5,
+    "sent": 5,
+    "drafts": 16,
+    "deleted items": 3,
+    "deleted": 3,
+    "trash": 3,
+    "outbox": 4,
+    "junk email": 23,
+    "junk": 23,
+    "spam": 23,
+}
+
+
+def _norm(value: Any) -> str:
+    return (str(value) if value is not None else "").strip().lower()
+
+
+def resolve_store(ns: Any, account: str) -> Any:
+    """Resolve an account identifier to its Store — by SMTP address, account
+    display name, or store display name. Raises FolderResolutionError listing
+    the available names when nothing matches. Reads only.
+    """
+    target = _norm(account)
+    if not target:
+        raise ValueError("account must be a non-empty string")
+
+    available: list[str] = []
+    accounts = ns.Accounts
+    for i in range(accounts.Count):
+        acc = accounts.Item(i + 1)
+        smtp = _norm(getattr(acc, "SmtpAddress", ""))
+        disp = _norm(getattr(acc, "DisplayName", ""))
+        if smtp:
+            available.append(smtp)
+        if target in (smtp, disp):
+            store = getattr(acc, "DeliveryStore", None)
+            if store is not None:
+                return store
+
+    stores = ns.Stores
+    for i in range(stores.Count):
+        st = stores.Item(i + 1)
+        name = getattr(st, "DisplayName", "") or ""
+        available.append(name)
+        if _norm(name) == target:
+            return st
+
+    raise FolderResolutionError(
+        f"No Outlook account or store matches {account!r}. "
+        f"Available: {sorted(set(available))}"
+    )
+
+
+def folder_path_of(folder: Any) -> str:
+    """Best-effort canonical path of a folder (e.g. '\\\\store\\Inbox')."""
+    try:
+        p = folder.FolderPath
+        if p:
+            return str(p)
+    except Exception:
+        pass
+    return getattr(folder, "Name", "") or ""
+
+
+def _looks_like_entry_id(value: str) -> bool:
+    v = value.strip()
+    return len(v) >= 32 and all(c in "0123456789abcdefABCDEF" for c in v)
+
+
+def _walk_children_ci(parent: Any, segment: str) -> tuple[Any | None, list[str]]:
+    """Case-insensitive child lookup. Returns (child_or_None, sibling_names)."""
+    target = _norm(segment)
+    names: list[str] = []
+    subs = parent.Folders
+    for j in range(subs.Count):
+        f = subs.Item(j + 1)
+        name = getattr(f, "Name", "") or ""
+        names.append(name)
+        if _norm(name) == target:
+            return f, names
+    return None, names
+
+
+def resolve_mail_folder(
+    folder: str | None = None,
+    account: str | None = None,
+    default_folder_id: int = 6,
+) -> Any:
+    """Resolve (folder, account) to a Folder object. NEVER falls back silently.
+
+    Accepted `folder` forms:
+      - None                        -> the default folder (Inbox unless
+                                       overridden) of `account`'s store, or of
+                                       the default store when account is None
+      - a folder EntryID            -> ns.GetFolderFromID (with the account's
+                                       StoreID when given)
+      - '\\\\store\\folder\\sub' or
+        'store/folder/sub'          -> explicit store-qualified path walk
+      - 'Sent Items' / 'Drafts' ... -> well-known folder resolved by TYPE in
+                                       the target store (localization-safe),
+                                       else by case-insensitive name among the
+                                       store root's children
+
+    Any resolution miss raises FolderResolutionError naming what IS available.
+    """
+    ns = get_namespace()
+
+    # --- EntryID form ----------------------------------------------------
+    if folder and _looks_like_entry_id(folder):
+        store_id = None
+        if account:
+            store_id = getattr(resolve_store(ns, account), "StoreID", None)
+        try:
+            if store_id:
+                return ns.GetFolderFromID(folder.strip(), store_id)
+            return ns.GetFolderFromID(folder.strip())
+        except Exception as exc:
+            raise FolderResolutionError(
+                f"Folder EntryID could not be resolved"
+                f"{' in account ' + account if account else ''}: {exc}"
+            ) from exc
+
+    parts = [p for p in (folder or "").replace("\\", "/").split("/") if p]
+
+    # --- store-qualified path form ----------------------------------------
+    if len(parts) >= 2:
+        roots = ns.Folders
+        current = None
+        root_names: list[str] = []
+        for i in range(roots.Count):
+            f = roots.Item(i + 1)
+            name = getattr(f, "Name", "") or ""
+            root_names.append(name)
+            if _norm(name) == _norm(parts[0]):
+                current = f
+                break
+        if current is not None:
+            remaining = parts[1:]
+        elif account:
+            # Path did not start with a store name; treat the whole path as
+            # relative to the requested account's store.
+            current = resolve_store(ns, account).GetRootFolder()
+            remaining = parts
+        else:
+            raise FolderResolutionError(
+                f"No store named {parts[0]!r}. Available stores: {root_names}"
+            )
+        for seg in remaining:
+            child, names = _walk_children_ci(current, seg)
+            if child is None:
+                raise FolderResolutionError(
+                    f"No subfolder {seg!r} under {folder_path_of(current)!r}. "
+                    f"Available: {names}"
+                )
+            current = child
+        return current
+
+    # --- single name (or None) within the target store ---------------------
+    store = resolve_store(ns, account) if account else ns.DefaultStore
+
+    if not parts:
+        return store.GetDefaultFolder(default_folder_id)
+
+    alias_id = MAIL_DEFAULT_FOLDER_ALIASES.get(_norm(parts[0]))
+    if alias_id is not None:
+        try:
+            return store.GetDefaultFolder(alias_id)
+        except Exception:
+            pass  # fall through to the literal name walk
+
+    root = store.GetRootFolder()
+    child, names = _walk_children_ci(root, parts[0])
+    if child is not None:
+        return child
+
+    raise FolderResolutionError(
+        f"No folder named {parts[0]!r} in store "
+        f"{getattr(store, 'DisplayName', '?')!r}. Available: {sorted(names)}"
+    )
+
+
 def get_item_by_entry_id(entry_id: str, store_id: str | None = None) -> Any:
     """Resolve any Outlook item by its EntryID.
 
