@@ -345,6 +345,57 @@ if DRAFTS_ENABLED:
         ).model_dump()
 
     @mcp.tool()
+    def create_reply_draft(
+        entry_id: str,
+        store_id: Optional[str] = None,
+        reply_all: bool = False,
+        body: Optional[str] = None,
+        html_body: Optional[str] = None,
+    ) -> dict:
+        """Create a TRUE reply draft to an existing email (by EntryID) —
+        correct thread identity (ConversationIndex/Topic), reply recipients,
+        and quoted history — saved UNSENT to Drafts.
+
+        This server can NEVER send it; only a human in Outlook can. The source
+        email is not modified. `reply_all=True` replies to all recipients.
+        `body`/`html_body` (mutually exclusive) is inserted above the quoted
+        history.
+        """
+        return draft_tools.create_reply_draft(
+            entry_id=entry_id,
+            store_id=store_id,
+            reply_all=reply_all,
+            body=body,
+            html_body=html_body,
+        ).model_dump()
+
+    @mcp.tool()
+    def create_forward_draft(
+        entry_id: str,
+        store_id: Optional[str] = None,
+        to: Optional[list[str]] = None,
+        cc: Optional[list[str]] = None,
+        body: Optional[str] = None,
+        html_body: Optional[str] = None,
+    ) -> dict:
+        """Create a TRUE forward draft of an existing email (by EntryID) —
+        'FW:' subject, quoted history, and the original's attachments — saved
+        UNSENT to Drafts.
+
+        This server can NEVER send it; only a human in Outlook can. The source
+        email is not modified. Recipients are optional and can be filled later
+        in Outlook. `body`/`html_body` is inserted above the quoted history.
+        """
+        return draft_tools.create_forward_draft(
+            entry_id=entry_id,
+            store_id=store_id,
+            to=to,
+            cc=cc,
+            body=body,
+            html_body=html_body,
+        ).model_dump()
+
+    @mcp.tool()
     def update_draft(
         entry_id: str,
         store_id: Optional[str] = None,
@@ -423,10 +474,11 @@ if DRAFTS_ENABLED:
 
 # Operations that are forbidden under EVERY configuration — these never become
 # available, drafts gate or not. Mirrors safety.SEND_FAMILY in spirit.
-# (Note: deleting/editing is possible for UNSENT DRAFTS only — never for sent
-# or received mail, which is runtime-enforced. Sending is never possible.)
+# (Note: reply/forward DRAFTS can be created when drafting is enabled — but
+# SENDING them, or anything else, is never possible. Editing/deleting is
+# runtime-confined to unsent drafts.)
 _ALWAYS_FORBIDDEN = [
-    "send", "submit", "reply", "reply_all", "forward", "deliver_now",
+    "send", "submit", "send_reply", "send_forward", "deliver_now",
     "move", "mark_as_read", "mark_as_unread", "display", "print",
     "send_draft", "modify_non_draft_item", "delete_non_draft_item",
 ]
@@ -435,6 +487,8 @@ _ALWAYS_FORBIDDEN = [
 # unsent drafts in the Drafts folder; none can send.
 _DRAFT_OPERATIONS = [
     "drafts.create_draft",
+    "drafts.create_reply_draft",
+    "drafts.create_forward_draft",
     "drafts.update_draft",
     "drafts.delete_draft",
     "drafts.add_draft_attachment",

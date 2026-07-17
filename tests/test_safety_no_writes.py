@@ -12,12 +12,14 @@ declares the forbidden names as data) and looks for, per file:
 The per-file forbidden sets come from `safety.forbidden_calls_for()` /
 `safety.forbidden_properties_for()`. Every file is scanned against the full
 forbidden set EXCEPT the single draft writer `tools/drafts.py`, which is
-permitted only `{CreateItem, Save, Subject, Body, HTMLBody, To, CC, BCC}`.
+permitted only `safety.DRAFT_ALLOWED` (compose methods CreateItem / Reply /
+ReplyAll / Forward, plus Save / Delete / attachment Add-Remove and the draft
+field setters). Reply*/Forward only CONSTRUCT items — they send nothing.
 
-Critically, the send family (`safety.SEND_FAMILY`: Send, Submit, Reply*,
-Forward, Move, Display, DeliverNow, GetInspector, ExecuteMso, SendKeys,
-Execute, Post, SetProperty*) is forbidden in EVERY file, drafts.py included.
-So the scan statically proves no source file can transition a draft to a sent
+Critically, the send family (`safety.SEND_FAMILY`: Send, Submit, Move,
+Display, DeliverNow, GetInspector, ExecuteMso, SendKeys, Execute, Post,
+SetProperty*, ...) is forbidden in EVERY file, drafts.py included. So the
+scan statically proves no source file can transition a draft to a sent
 state — the "can never send" guarantee.
 """
 
@@ -178,31 +180,47 @@ def test_send_family_never_appears_anywhere() -> None:
 
 
 def test_send_family_contains_the_critical_names() -> None:
-    """Tripwire: the send family must not be silently narrowed."""
+    """Tripwire: the send family must not be silently narrowed.
+
+    Reply/ReplyAll/Forward are deliberately NOT here: in the Outlook object
+    model they only CONSTRUCT a new MailItem (thread identity, recipients,
+    quoted history) and send nothing. They are compose methods permitted in
+    drafts.py only; the actual send/relocate primitives below are what can
+    dispatch mail, and they stay forbidden everywhere.
+    """
     for required in (
-        "Send", "Submit", "Reply", "ReplyAll", "Forward",
-        "DeliverNow", "Move", "Display", "GetInspector",
+        "Send", "Submit", "DeliverNow", "SaveSentMessageFolder",
+        "Move", "Display", "GetInspector",
         "ExecuteMso", "SendKeys", "Execute", "Post",
-        "SetProperty", "SetProperties",
+        "SetProperty", "SetProperties", "ReplyAllEx",
     ):
         assert required in SEND_FAMILY, f"{required} missing from SEND_FAMILY"
     # The draft carve-out must never intersect the send family.
     assert DRAFT_ALLOWED.isdisjoint(SEND_FAMILY)
+    # Compose methods live in the draft carve-out, not the send family.
+    for compose in ("Reply", "ReplyAll", "Forward"):
+        assert compose not in SEND_FAMILY
+        assert compose in DRAFT_ALLOWED_METHODS
 
 
 def test_draft_carveout_permits_management_but_never_send() -> None:
-    """drafts.py may create/save/delete/attach — but never any send symbol.
-
-    And every newly-permitted mutator stays forbidden in all other files.
+    """drafts.py may create/reply/forward/save/delete/attach — but never any
+    send symbol. And every permitted mutator stays forbidden everywhere else.
     """
     drafts_calls = forbidden_calls_for("drafts.py")
-    for allowed in ("CreateItem", "Save", "Delete", "Add", "Remove"):
+    for allowed in (
+        "CreateItem", "Reply", "ReplyAll", "Forward",
+        "Save", "Delete", "Add", "Remove",
+    ):
         assert allowed not in drafts_calls, f"{allowed} should be permitted in drafts.py"
     for blocked in SEND_FAMILY:
         assert blocked in drafts_calls, f"{blocked} must stay forbidden in drafts.py"
 
     other_calls = forbidden_calls_for("mail.py")
-    for must_block in ("CreateItem", "Save", "Delete", "Add", "Remove"):
+    for must_block in (
+        "CreateItem", "Reply", "ReplyAll", "Forward",
+        "Save", "Delete", "Add", "Remove",
+    ):
         assert must_block in other_calls, (
             f"{must_block} must remain forbidden outside the draft writer"
         )
@@ -271,6 +289,7 @@ def test_scanner_catches_send_even_with_draft_carveout(tmp_path) -> None:
         "def f(item):\n"
         "    item.Save()\n"            # allowed in drafts.py
         "    item.Subject = 'x'\n"     # allowed in drafts.py
+        "    item.Reply()\n"           # allowed in drafts.py (compose only)
         "    item.Send()\n"            # FORBIDDEN even in drafts.py
         "    getattr(item, 'Send')()\n"  # dynamic send — also forbidden
         "    f2 = getattr(item, 'Submit')\n",  # deferred send ref — forbidden
@@ -282,14 +301,34 @@ def test_scanner_catches_send_even_with_draft_carveout(tmp_path) -> None:
     )
     scanner.visit(ast.parse(bad.read_text(encoding="utf-8")))
     kinds = {(k, n) for _, k, n in scanner.violations}
-    # Save + Subject are allowed → must NOT be flagged.
+    # Save + Subject + Reply are allowed → must NOT be flagged.
     assert ("call", "Save") not in kinds
     assert ("assign", "Subject") not in kinds
+    assert ("call", "Reply") not in kinds
     # Send/Submit must be flagged via every channel.
     assert ("call", "Send") in kinds
     assert ("getattr-call", "Send") in kinds
     assert ("getattr-name", "Send") in kinds
     assert ("getattr-name", "Submit") in kinds
+
+
+def test_reply_forward_forbidden_outside_draft_writer(tmp_path) -> None:
+    """`x.Reply()` in any non-drafts file must be flagged by the scan."""
+    bad = tmp_path / "mail.py"
+    bad.write_text(
+        "def f(item):\n"
+        "    item.Reply()\n"
+        "    item.Forward()\n",
+        encoding="utf-8",
+    )
+    scanner = _Scanner(
+        forbidden_calls=forbidden_calls_for("mail.py"),
+        forbidden_props=forbidden_properties_for("mail.py"),
+    )
+    scanner.visit(ast.parse(bad.read_text(encoding="utf-8")))
+    kinds = {(k, n) for _, k, n in scanner.violations}
+    assert ("call", "Reply") in kinds
+    assert ("call", "Forward") in kinds
 
 
 # ---------------------------------------------------------------------------

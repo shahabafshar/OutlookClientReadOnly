@@ -2,6 +2,10 @@
 
 Operations (all confined to UNSENT drafts in the Drafts folder):
   - create_draft            : compose and save a new unsent draft
+  - create_reply_draft      : true reply/reply-all draft (thread identity,
+                              recipients, quoted history) — never sends
+  - create_forward_draft    : true forward draft (FW subject, original
+                              attachments) — never sends
   - update_draft            : edit fields of an existing draft
   - delete_draft            : remove a draft (-> Deleted Items, recoverable)
   - add_draft_attachment    : attach a file to a draft
@@ -11,12 +15,14 @@ Two layers of safety
 --------------------
 1. STATIC (can never send). This file is scanned (tests/test_safety_no_writes)
    against the full forbidden set minus only
-   `{CreateItem, Save, Delete, Add, Remove, Subject, Body, HTMLBody, To, CC,
-   BCC}`. Every symbol in `safety.SEND_FAMILY` — Send, Submit, DeliverNow,
-   Reply*, Forward, Move, Display, GetInspector, ExecuteMso, SendKeys, Execute,
-   Post, SetProperty* — stays forbidden here too, including `getattr("Send")`
-   tricks. A draft therefore can never be sent or moved to the Outbox by this
-   server. (Outlook only sends from the Outbox; we have no path there.)
+   `{CreateItem, Reply, ReplyAll, Forward, Save, Delete, Add, Remove, Subject,
+   Body, HTMLBody, To, CC, BCC}`. Reply/ReplyAll/Forward are COMPOSE methods:
+   they construct a new MailItem and send nothing. Every symbol in
+   `safety.SEND_FAMILY` — Send, Submit, DeliverNow, Move, Display,
+   GetInspector, ExecuteMso, SendKeys, Execute, Post, SetProperty* — stays
+   forbidden here too, including `getattr("Send")` tricks. A draft therefore
+   can never be sent or moved to the Outbox by this server. (Outlook only
+   sends from the Outbox; we have no path there.)
 
 2. RUNTIME (only ever touch drafts). `Delete`/`Add`/`Remove` are generic
    mutators, so the static scan no longer proves we mutate *only* drafts. That
@@ -24,6 +30,9 @@ Two layers of safety
    and refuses anything that is not an UNSENT item physically located in the
    Drafts folder. Every mutating op below calls it first, so the server can
    never edit or delete a sent message, a received mail, or any non-draft item.
+   Reply/Forward read their source item without modifying it, and their
+   result must pass `_verify_saved_draft` (unsent + in Drafts) before being
+   reported.
 
 Honest limits
 -------------
@@ -232,6 +241,109 @@ def create_draft(
             )
 
         return _draft_result(item, created=True)
+
+
+# ---------------------------------------------------------------------------
+# Reply / forward drafts (true threading — never sends)
+# ---------------------------------------------------------------------------
+
+def _verify_saved_draft(item: Any) -> None:
+    """Post-Save guards shared by reply/forward creation (reads only).
+
+    The saved item must report Sent=False and physically live in the Drafts
+    default folder of its own store; otherwise we refuse to report success.
+    """
+    if bool(getattr(item, "Sent", False)):
+        raise RuntimeError("Aborting: created item reports Sent=True.")
+    parent = item.Parent
+    parent_entry_id = getattr(parent, "EntryID", "") if parent is not None else ""
+    drafts_entry_id = _drafts_entry_id_for_item(item)
+    if not drafts_entry_id or parent_entry_id != drafts_entry_id:
+        parent_name = getattr(parent, "Name", "") if parent is not None else ""
+        raise RuntimeError(
+            f"Aborting: draft landed in {parent_name!r}, not Drafts."
+        )
+
+
+def _resolve_source_mail(entry_id: str, store_id: Optional[str]) -> Any:
+    """Resolve the mail item a reply/forward is based on. Read-only access —
+    the source item is never modified."""
+    if not entry_id:
+        raise ValueError("entry_id is required")
+    item = outlook.get_item_by_entry_id(entry_id, store_id)
+    message_class = getattr(item, "MessageClass", "") or ""
+    if not message_class.startswith("IPM.Note"):
+        raise ValueError(
+            f"Source item is not a mail item (MessageClass={message_class!r})."
+        )
+    return item
+
+
+def _prepend_body(draft: Any, body: Optional[str], html_body: Optional[str]) -> None:
+    """Insert the caller's message above the quoted history Outlook built."""
+    if body is not None and html_body is not None:
+        raise ValueError("Provide either body or html_body, not both.")
+    if html_body is not None:
+        existing = getattr(draft, "HTMLBody", "") or ""
+        draft.HTMLBody = html_body + existing
+    elif body is not None:
+        existing = getattr(draft, "Body", "") or ""
+        draft.Body = body + "\n\n" + existing
+
+
+def create_reply_draft(
+    entry_id: str,
+    store_id: Optional[str] = None,
+    reply_all: bool = False,
+    body: Optional[str] = None,
+    html_body: Optional[str] = None,
+) -> DraftResult:
+    """Create a TRUE reply draft to an existing email — correct thread
+    identity (ConversationIndex/Topic), reply recipients, and quoted history —
+    saved UNSENT to Drafts.
+
+    `Reply()`/`ReplyAll()` only CONSTRUCT the reply item; nothing is sent and
+    the source email is not modified. `body`/`html_body` (mutually exclusive)
+    is inserted above the quoted history. The result is verified unsent and
+    in Drafts before returning; sending remains statically impossible.
+    """
+    with outlook.com_apartment():
+        source = _resolve_source_mail(entry_id, store_id)
+        draft = source.ReplyAll() if reply_all else source.Reply()
+        _prepend_body(draft, body, html_body)
+        draft.Save()  # -> Drafts. Never sends.
+        _verify_saved_draft(draft)
+        return _draft_result(draft, created=True)
+
+
+def create_forward_draft(
+    entry_id: str,
+    store_id: Optional[str] = None,
+    to: Optional[list[str]] = None,
+    cc: Optional[list[str]] = None,
+    body: Optional[str] = None,
+    html_body: Optional[str] = None,
+) -> DraftResult:
+    """Create a TRUE forward draft of an existing email — 'FW:' subject,
+    quoted history, and the original's attachments — saved UNSENT to Drafts.
+
+    `Forward()` only CONSTRUCTS the forward item; nothing is sent and the
+    source email is not modified. Recipients are optional (fill them here or
+    later in Outlook); with no recipients the draft cannot go anywhere even
+    manually. Verified unsent and in Drafts before returning.
+    """
+    with outlook.com_apartment():
+        source = _resolve_source_mail(entry_id, store_id)
+        draft = source.Forward()
+        to_str, cc_str = _join_recipients(to), _join_recipients(cc)
+        if to_str:
+            draft.To = to_str
+        if cc_str:
+            draft.CC = cc_str
+        _prepend_body(draft, body, html_body)
+        draft.Save()  # -> Drafts. Never sends.
+        _verify_saved_draft(draft)
+        return _draft_result(draft, created=True)
 
 
 # ---------------------------------------------------------------------------

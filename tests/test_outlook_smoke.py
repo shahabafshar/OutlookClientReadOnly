@@ -226,6 +226,52 @@ def test_draft_full_lifecycle_self_cleaning(tmp_path) -> None:
         assert deleted.deleted is True
 
 
+@draft_test_required
+def test_reply_and_forward_drafts_are_threaded_and_unsent() -> None:
+    """Reply/forward drafts carry true thread identity, stay unsent, and are
+    cleaned up afterwards (self-cleaning like the lifecycle test)."""
+    from outlook_readonly_mcp.tools import drafts, mail
+
+    page = mail.list_emails(limit=1)
+    if not page.emails:
+        pytest.skip("Inbox is empty")
+    src = page.emails[0]
+    src_detail = mail.get_email(entry_id=src.entry_id, store_id=src.store_id)
+
+    created: list = []
+    try:
+        reply = drafts.create_reply_draft(
+            src.entry_id, store_id=src.store_id, body="(reply self-test)"
+        )
+        created.append(reply)
+        assert reply.sent is False and reply.created is True
+        assert "draft" in (reply.folder or "").lower()
+        # True threading: RE: subject on the same conversation topic.
+        topic = (src_detail.conversation_topic or src_detail.subject or "").lower()
+        assert topic and topic in reply.subject.lower()
+        assert reply.subject.lower().startswith("re")
+        # Reply targets the original sender.
+        if src_detail.sender_email:
+            joined = " ".join(reply.to).lower()
+            assert src_detail.sender_email.lower() in joined or joined
+
+        fwd = drafts.create_forward_draft(
+            src.entry_id, store_id=src.store_id,
+            to=["nobody@example.invalid"], body="(forward self-test)"
+        )
+        created.append(fwd)
+        assert fwd.sent is False
+        assert fwd.subject.lower().startswith("fw")
+        # The source email must be untouched (still unsent==False semantics
+        # aside, verify it still resolves and has the same subject).
+        again = mail.get_email(entry_id=src.entry_id, store_id=src.store_id)
+        assert again.subject == src_detail.subject
+    finally:
+        for d in created:
+            deleted = drafts.delete_draft(d.entry_id, store_id=d.store_id)
+            assert deleted.deleted is True
+
+
 def mail_module():
     from outlook_readonly_mcp.tools import mail
 

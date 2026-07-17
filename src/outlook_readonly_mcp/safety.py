@@ -10,13 +10,14 @@ delete, save, move/copy, mark-as-read, reply, forward, print, create-item,
 display (which can flip UnRead), low-level MAPI writes, and direct
 collection mutations.
 
-Draft creation (optional, env-gated) is the *only* write the server can
-perform, and it is confined to a single module — `tools/drafts.py`. That one
-file is granted a tiny carve-out (`CreateItem`, `Save`, and the property
-setters needed to compose a draft) via `forbidden_calls_for()` /
-`forbidden_properties_for()`. Crucially, the carve-out does NOT include any
-symbol in `SEND_FAMILY`: send, submit, reply, forward, move, display, etc.
-remain forbidden in drafts.py exactly as everywhere else. The scan therefore
+Draft management (optional, env-gated) is the *only* write surface, confined
+to a single module — `tools/drafts.py`. That file is granted a carve-out
+(`CreateItem`, `Reply`, `ReplyAll`, `Forward` as COMPOSE methods, `Save`,
+`Delete`, attachment `Add`/`Remove`, and the property setters needed to
+compose a draft) via `forbidden_calls_for()` / `forbidden_properties_for()`.
+Crucially, the carve-out does NOT include any symbol in `SEND_FAMILY`: send,
+submit, move, display, deliver-now, MAPI submit-flag writes, etc. remain
+forbidden in drafts.py exactly as everywhere else. The scan therefore
 statically proves that no source file — drafts.py included — can transition a
 draft from Drafts to a sent state.
 """
@@ -89,14 +90,21 @@ ALL_FORBIDDEN: frozenset[str] = (
 
 # All symbols that can cause an email to be SENT, or are a precondition to a
 # send (UI display + ribbon + synthetic keystrokes, relocation to the Outbox,
-# the reply/forward pipeline, MAPI submit-flag writes). These are forbidden in
-# EVERY file — including the draft writer `tools/drafts.py`. This is the
-# load-bearing "can never send" guarantee: the scan proves none of these names
-# appears anywhere in source, as a method call, an assignment, or a `getattr`
-# string literal.
+# MAPI submit-flag writes). These are forbidden in EVERY file — including the
+# draft writer `tools/drafts.py`. This is the load-bearing "can never send"
+# guarantee: the scan proves none of these names appears anywhere in source,
+# as a method call, an assignment, or a `getattr` string literal.
+#
+# NOTE on Reply/ReplyAll/Forward: these are NOT send operations in the Outlook
+# object model — item.Reply() merely CONSTRUCTS a new MailItem pre-wired with
+# thread identity (ConversationIndex/Topic), recipients, and quoted history.
+# Nothing leaves the machine unless Send/Submit/Move-to-Outbox happens later,
+# and all of those stay in this set. They are therefore classified as compose
+# methods in the drafts carve-out (drafts.py only), not send-family.
+# `ReplyAllEx` and the Actions `Execute` pipeline remain forbidden everywhere.
 SEND_FAMILY: frozenset[str] = frozenset({
     "Send", "Submit", "DeliverNow", "SaveSentMessageFolder",
-    "Reply", "ReplyAll", "ReplyAllEx", "Forward",
+    "ReplyAllEx",
     "Post", "Execute", "ExecuteMso", "SendKeys", "GetInspector",
     "Display", "Move", "SetProperty", "SetProperties",
 })
@@ -110,8 +118,12 @@ DRAFT_MODULE_BASENAME = "drafts.py"
 
 # The mutating calls the draft writer may use. ALL of these are disjoint from
 # SEND_FAMILY, so permitting them in drafts.py does not weaken the can-never-
-# send guarantee one bit (Move/Send/Submit/Reply*/Forward all stay forbidden):
+# send guarantee one bit (Move/Send/Submit/Display/SetProperty* stay forbidden):
 #   CreateItem  - make a new mail item
+#   Reply       - CONSTRUCT a reply MailItem (correct thread identity,
+#   ReplyAll      recipients, quoted history). Does not send; the result is
+#                 immediately Save()d into Drafts and verified unsent.
+#   Forward     - CONSTRUCT a forward MailItem (carries original attachments).
 #   Save        - persist to Drafts (never sends; Send would route to Outbox)
 #   Delete      - remove a draft (runtime-guarded to drafts only; recoverable
 #                 via Deleted Items)
@@ -122,9 +134,10 @@ DRAFT_MODULE_BASENAME = "drafts.py"
 # proves drafts.py only mutates *drafts* — that is enforced at RUNTIME by
 # `tools/drafts._resolve_editable_draft`, which refuses any item that is not an
 # unsent item physically in the Drafts folder. Edit/delete/attachment ops MUST
-# go through that guard.
+# go through that guard. Reply/ReplyAll/Forward read the source item without
+# modifying it and their result MUST be routed through the saved-draft guard.
 DRAFT_ALLOWED_METHODS: frozenset[str] = frozenset({
-    "CreateItem", "Save", "Delete", "Add", "Remove",
+    "CreateItem", "Reply", "ReplyAll", "Forward", "Save", "Delete", "Add", "Remove",
 })
 
 # The only properties the draft writer may assign: the fields of a draft.
@@ -150,7 +163,7 @@ def forbidden_calls_for(filename: str) -> frozenset[str]:
     """Effective set of forbidden *call* names for a given source file.
 
     Every file is forbidden the full method + application-method set, except
-    the draft writer, which is permitted `CreateItem` and `Save` only. The
+    the draft writer, which is permitted DRAFT_ALLOWED_METHODS only. The
     send family is never removed, so it stays forbidden in drafts.py too.
     """
     base = FORBIDDEN_METHODS | FORBIDDEN_APPLICATION_METHODS
