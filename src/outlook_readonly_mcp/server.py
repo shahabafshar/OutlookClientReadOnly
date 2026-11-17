@@ -15,13 +15,28 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+# Fast start: skip optional modules the MCP SDK drags in at import time but
+# this stdio server never uses. Each import site has an ImportError fallback,
+# and a `None` entry in sys.modules makes the import raise ModuleNotFoundError,
+# so the SDK takes that fallback. Together these were ~30% of the server's
+# startup imports; on a busy machine the full import took longer than the MCP
+# client's 30 s connection timeout.
+#   rfc3987_syntax - jsonschema's optional "iri" format checker; compiles a Lark
+#                    grammar on import.
+#   httpx._main    - httpx's command-line client (pulls in rich/pygments).
+#   rich           - FastMCP's pretty stderr logging; falls back to a plain
+#                    logging.StreamHandler.
+for _optional in ("rfc3987_syntax", "httpx._main", "rich"):
+    sys.modules.setdefault(_optional, None)  # type: ignore[arg-type]
+del _optional
 
-from . import __version__
-from .tools import calendar as cal_tools
-from .tools import contacts as contact_tools
-from .tools import mail as mail_tools
-from .tools import tasks as task_tools
+from mcp.server.fastmcp import FastMCP  # noqa: E402
+
+from . import __version__  # noqa: E402
+from .tools import calendar as cal_tools  # noqa: E402
+from .tools import contacts as contact_tools  # noqa: E402
+from .tools import mail as mail_tools  # noqa: E402
+from .tools import tasks as task_tools  # noqa: E402
 
 
 def _drafts_enabled() -> bool:
